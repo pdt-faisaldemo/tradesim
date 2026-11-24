@@ -18,6 +18,8 @@ const CHAOS_API_URL = process.env.CHAOS_API_URL || 'http://chaos-api.platform:80
 const FLAG_POLL_MS = parseInt(process.env.FLAG_POLL_MS || '5000', 10);
 const PRICES_KEY = 'tradesim:prices';
 const VOLATILITY = 0.0015; // per-tick standard deviation of the random walk
+const REVERSION = 0.003; // per-tick pull back towards the ticker's starting price
+const MAX_DRIFT = 0.08; // hard bound around the starting price (+/- 8%)
 
 const logger = createLogger({ service: SERVICE, version: VERSION });
 
@@ -66,8 +68,9 @@ mountStandardRoutes(app, {
   ],
 });
 
-// ---- price simulator: random walk, one tick per TICK_INTERVAL_MS, written to Redis ----
+// ---- price simulator: mean-reverting random walk, one tick per TICK_INTERVAL_MS, written to Redis ----
 const prices = { ...START_PRICES };
+const bounded = (s, p) => Math.min(START_PRICES[s] * (1 + MAX_DRIFT), Math.max(START_PRICES[s] * (1 - MAX_DRIFT), p));
 
 function gaussian() {
   return Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
@@ -75,7 +78,8 @@ function gaussian() {
 
 async function tick() {
   for (const s of SYMBOLS) {
-    prices[s] = Math.max(1, Math.round(prices[s] * (1 + VOLATILITY * gaussian()) * 100) / 100);
+    const walk = prices[s] * (1 + VOLATILITY * gaussian());
+    prices[s] = Math.round(bounded(s, walk + REVERSION * (START_PRICES[s] - prices[s])) * 100) / 100;
   }
   const fields = { ...prices, asOf: new Date().toISOString() };
   await redis.hset(PRICES_KEY, fields);
@@ -126,7 +130,7 @@ redis.on('ready', async () => {
   started = true;
   try {
     const stored = await redis.hgetall(PRICES_KEY);
-    for (const s of SYMBOLS) if (stored[s]) prices[s] = Number(stored[s]);
+    for (const s of SYMBOLS) if (stored[s]) prices[s] = bounded(s, Number(stored[s]));
   } catch (err) {
     logger.warn(`could not load stored prices, using starting prices: ${err.message}`);
   }

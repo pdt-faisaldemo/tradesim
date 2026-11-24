@@ -51,7 +51,7 @@ app.get('/api/orders', route(async (req, res) => {
 
 // POST /api/orders {customerId?, symbol, qty}: the gateway prices the order from market-data.
 // Orders that fail for a system reason (5xx, timeout, or valid orders declined by the risk check) feed the
-// incident panel's "revenue at risk".
+// incident panel's "revenue at risk". Orders filled on a price older than 30s feed "trades at stale prices".
 app.post('/api/orders', route(async (req, res) => {
   const { symbol, qty } = req.body || {};
   const customerId = (req.body && req.body.customerId) || DEFAULT_CUSTOMER;
@@ -74,6 +74,7 @@ app.post('/api/orders', route(async (req, res) => {
     throw err;
   }
   if (upstream.status === 422) panel.recordFailedOrder(orderValue);
+  if (upstream.status === 201) panel.recordFill(orderValue, (Date.now() - Date.parse(quotes.body.asOf)) / 1000);
   relay(res, upstream);
 }));
 
@@ -116,13 +117,18 @@ app.get('/api/incident-panel', route(async (req, res) => {
   res.json(panel.snapshot());
 }));
 
-// Banner: degraded when any service is unhealthy or the incident panel has an incident in progress
-// (silent faults such as S1 keep every /health green).
+// Banner: driven by the same snapshot as /api/incident-panel so the two always agree. Degraded while an incident is
+// in progress (silent faults such as S1 keep every /health green); resetting while scripts/reset.sh runs.
 app.get('/api/status', route(async (req, res) => {
+  const { phase, source } = panel.snapshot();
   const summary = sampler.summary();
-  const unhealthy = summary.services.filter((s) => !s.healthy).map((s) => s.name);
-  const incident = panel.snapshot().phase === 'incident';
-  res.json({ degraded: unhealthy.length > 0 || incident, source: panel.pdEnabled ? 'pagerduty' : 'health-summary', unhealthy, asOf: summary.asOf });
+  res.json({
+    degraded: phase === 'incident',
+    resetting: phase === 'resetting',
+    source,
+    unhealthy: summary.services.filter((s) => !s.healthy).map((s) => s.name),
+    asOf: summary.asOf,
+  });
 }));
 
 app.use('/api', (req, res) => {

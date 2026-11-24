@@ -29,14 +29,14 @@ Through the gateway (`http://<EC2_IP>/`): `/api/health-summary`, `/api/quotes`, 
 `/api/portfolio/c-1001`, `/api/orders`, `POST /api/orders {"symbol":"NVDA","qty":50}`.
 
 ## P4: fault scenarios, scripts, loadgen
-Baseline images: `gateway` `v1.0.0-ui3`, every other service `v1.0.0` (also `loadgen` and `chaos-api` `v1.0.0`).
+Baseline images: `gateway` `v1.0.0-ui4`, every other service `v1.0.0` (also `loadgen` and `chaos-api` `v1.0.0`).
 Fault images: `risk:v1.0.1` from `demo/bad-risk-check` (S1) and `portfolio:v1.0.1` from `demo/portfolio-leak` (S4).
 
 Build each with Actions -> `build-image` (inputs `service`, `git_ref`, `tag`):
 
 | service | git_ref | tag |
 |---|---|---|
-| gateway | main | v1.0.0-ui3 |
+| gateway | main | v1.0.0-ui4 |
 | account, market-data, risk, order, portfolio | main | v1.0.0 |
 | loadgen, chaos-api | main | v1.0.0 |
 | risk | demo/bad-risk-check | v1.0.1 |
@@ -56,14 +56,28 @@ nano ~/.tradesim.env        # start from scripts/tradesim.env.example; set KUBEC
 scripts/scenario.sh <S1|S2|S3|S4|S5|COMBO> [quick|deep]   # refuses if one is already active (FORCE=1 overrides)
 scripts/reset.sh                                          # prints ALL HEALTHY
 ```
-S2 sends the decoy change event on portfolio, waits `S2_DECOY_DELAY_S` (default 60), then sets account `DB_MAX_POOL=2` and `DB_POOL_TIMEOUT_MS=500` (account answers 503 `db pool exhausted: 2/2 in use, waited 500ms`; reset restores 50 / 2000).
+S2 sends the decoy change event on portfolio, waits `S2_DECOY_DELAY_S` (default 60), then sets account `DB_MAX_POOL=1` and `DB_POOL_TIMEOUT_MS=300`, each account query then holds its connection 1000ms (only while `DB_MAX_POOL` < 10), and loadgen goes from 5 to 20 customers (account answers 503 `db pool exhausted: 1/1 in use, waited 300ms`; reset restores 50 / 2000 / no hold / 5 customers). `scripts/verify-s2.sh` prints per-service error rates and the pool stats; `scripts/verify-s5.sh` prints the account pod's status, restart count and last log lines.
 
 ### Incident panel (gateway UI)
-Right panel (incident status) and left panel (Reliability delivered) are fed by `GET /api/incident-panel`. The gateway
-polls chaos-api `/state` and, when `PD_API_TOKEN` and `PD_SERVICE_IDS` are in `tradesim-secrets`, the PagerDuty REST API
-every 5s; otherwise (or if the API fails) it uses health and error-rate signals only. It only evaluates while a scenario is
-active; reset clears the scenario and restarts the gateway, which clears the panel. Tunables live in
-`k8s/base/configmaps/tradesim-gateway-config.yaml`: `REVENUE_AT_RISK_PER_S` (500), `ENGINEER_HOURLY_RATE` (150),
+Right panel (incident status) and left panel (Reliability delivered) are fed by `GET /api/incident-panel`; the status
+banner and the health dots use the same data, so they always agree. The gateway polls chaos-api `/state` every 2s and,
+when `PD_API_TOKEN` and `PD_SERVICE_IDS` are in `tradesim-secrets`, the PagerDuty REST API every 5s; without them (or if
+the API fails) it uses health and error-rate signals only.
+
+- A dot is red when `/health` fails or the service's `error_rate_30s` (from `/metrics`) is above 0.2 with 10+ requests.
+- While a scenario is active, health alone never shows Resolved. The panel stays in incident until the PagerDuty incident
+  is resolved (needs `PD_API_TOKEN`), or the scenario is cleared: `scripts/clear-scenario.sh` (called by the Rundeck fix
+  jobs) shows Resolved, `scripts/reset.sh` returns to healthy. With no scenario known (chaos-api unreachable) the
+  health-only fallback needs 60 consecutive healthy seconds.
+- "Root cause found" shows the `Panel summary:` line of the first incident note starting `SRE Agent:` (max 60 chars,
+  cut at a word, with a link to the incident); without that line it shows the scenario's preset text. The left panel
+  always uses preset headlines.
+- During `reset.sh`, chaos-api `/state` has `resetting: true`: dots grey, banner "Applying scheduled updates. Back in a
+  moment.", panel "Applying updates...". reset.sh only restarts Deployments that differ from the baseline.
+- S3 shows "Trades at stale prices" (orders filled while the price feed was older than 30s, with their total value)
+  instead of "Revenue at risk".
+
+Tunables live in `k8s/base/configmaps/tradesim-gateway-config.yaml`: `REVENUE_AT_RISK_PER_S` (500), `ENGINEER_HOURLY_RATE` (150),
 `DEFAULT_ENGINEERS` (1), `TYPICAL_COMPARISON`.
 Enable PagerDuty data on EC2:
 ```

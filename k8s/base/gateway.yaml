@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: gateway
-          image: ghcr.io/pdt-faisaldemo/tradesim-gateway:v1.0.0-ui3
+          image: ghcr.io/pdt-faisaldemo/tradesim-gateway:v1.0.0-ui4
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
