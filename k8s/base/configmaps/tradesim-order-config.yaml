@@ -1,0 +1,10 @@
+# Baseline copy: scripts/reset.sh re-applies this file.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tradesim-order-config
+  namespace: tradesim
+data:
+  RISK_URL: "http://risk:8082"
+  ACCOUNT_URL: "http://account:8083"
+  DB_HOST: "postgres"

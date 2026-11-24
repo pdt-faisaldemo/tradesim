@@ -54,4 +54,18 @@ function respondUpstreamError(req, res, err) {
   return res.status(status).json({ error: err.message, upstream: err.upstream, traceId: req.traceId });
 }
 
-module.exports = { call, respondUpstreamError, UpstreamError, DEFAULT_TIMEOUT_MS };
+// Wraps an async Express handler: UpstreamError -> standard 502/503 cascade response,
+// anything else -> 500. Express 4 does not catch rejected promises on its own.
+function route(handler) {
+  return async (req, res) => {
+    try {
+      await handler(req, res);
+    } catch (err) {
+      if (err instanceof UpstreamError) return respondUpstreamError(req, res, err);
+      res.locals.logMsg = `unhandled error: ${err.stack || err.message}`;
+      res.status(500).json({ error: 'internal error', traceId: req.traceId });
+    }
+  };
+}
+
+module.exports = { call, respondUpstreamError, route, UpstreamError, DEFAULT_TIMEOUT_MS };

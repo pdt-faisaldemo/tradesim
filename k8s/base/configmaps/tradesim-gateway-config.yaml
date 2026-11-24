@@ -1,0 +1,12 @@
+# Baseline copy: scripts/reset.sh re-applies this file.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tradesim-gateway-config
+  namespace: tradesim
+data:
+  ORDER_URL: "http://order:8081"
+  RISK_URL: "http://risk:8082"
+  ACCOUNT_URL: "http://account:8083"
+  PORTFOLIO_URL: "http://portfolio:8084"
+  MARKET_DATA_URL: "http://market-data:8085"

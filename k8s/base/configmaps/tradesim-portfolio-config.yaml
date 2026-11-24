@@ -1,0 +1,10 @@
+# Baseline copy: scripts/reset.sh re-applies this file.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tradesim-portfolio-config
+  namespace: tradesim
+data:
+  MARKET_DATA_URL: "http://market-data:8085"
+  ACCOUNT_URL: "http://account:8083"
+  DB_HOST: "postgres"

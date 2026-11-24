@@ -14,6 +14,31 @@ data:
     );
     INSERT INTO accounts (id, name, cash) VALUES ('c-1001', 'Jordan Lee', 41870.00)
     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, cash = EXCLUDED.cash, updated_at = now();
+
+    CREATE TABLE IF NOT EXISTS orders (
+      id          text PRIMARY KEY,
+      customer_id text NOT NULL,
+      symbol      text NOT NULL,
+      qty         integer NOT NULL CHECK (qty > 0),
+      price       numeric(14,2) NOT NULL,
+      cost        numeric(14,2) NOT NULL,
+      created_at  timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS orders_customer_created ON orders (customer_id, created_at DESC);
+    CREATE TABLE IF NOT EXISTS positions (
+      customer_id text NOT NULL,
+      symbol      text NOT NULL,
+      qty         integer NOT NULL CHECK (qty > 0),
+      avg_cost    numeric(14,4) NOT NULL,
+      PRIMARY KEY (customer_id, symbol)
+    );
+    -- Reset state: no order history, a small starting portfolio.
+    TRUNCATE orders;
+    DELETE FROM positions;
+    INSERT INTO positions (customer_id, symbol, qty, avg_cost) VALUES
+      ('c-1001', 'AMZN', 40, 208.15),
+      ('c-1001', 'IBM', 25, 255.00),
+      ('c-1001', 'CRWD', 10, 455.00);
 ---
 apiVersion: batch/v1
 kind: Job

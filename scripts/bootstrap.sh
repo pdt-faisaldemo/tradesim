@@ -28,7 +28,20 @@ $K -n tradesim delete job seed --ignore-not-found
 $K apply -f k8s/base/seed-job.yaml
 $K -n tradesim wait --for=condition=complete job/seed --timeout=120s
 
-echo "==> account"
-$K apply -f k8s/base/account.yaml
-$K -n tradesim rollout status deploy/account --timeout=120s
+echo "==> redis"
+$K apply -f k8s/base/redis.yaml
+$K -n tradesim rollout status deploy/redis --timeout=120s
+
+# Dependency order: account, market-data, then the services that call them.
+SERVICES="account market-data risk order portfolio gateway"
+for svc in $SERVICES; do
+  echo "==> $svc"
+  $K apply -f k8s/base/$svc.yaml
+done
+for svc in $SERVICES; do
+  $K -n tradesim rollout status deploy/$svc --timeout=120s
+done
+
+echo "==> ingress"
+$K apply -f k8s/base/ingress.yaml
 echo "bootstrap done"

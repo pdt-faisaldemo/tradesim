@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order
+  namespace: tradesim
+  labels: {app: order}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: order}
+  template:
+    metadata:
+      labels: {app: order}
+    spec:
+      containers:
+        - name: order
+          image: ghcr.io/pdt-faisaldemo/tradesim-order:v1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8081
+          envFrom:
+            - configMapRef: {name: tradesim-order-config}
+          env:
+            - {name: DB_USER, value: tradesim}
+            - {name: DB_NAME, value: tradesim}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: tradesim-secrets, key: DB_PASSWORD}
+          # TCP only on purpose: gating readiness on /health would pull the pod out of the Service
+          # and hide the very symptoms the demo is about.
+          readinessProbe:
+            tcpSocket: {port: 8081}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order
+  namespace: tradesim
+spec:
+  selector: {app: order}
+  ports:
+    - {port: 8081, targetPort: 8081}
