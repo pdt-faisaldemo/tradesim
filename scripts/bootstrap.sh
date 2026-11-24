@@ -2,7 +2,8 @@
 # Idempotent first-time setup + (re)apply of everything in k8s/base. Safe to re-run.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-K=${KUBECTL:-kubectl}
+# Loads ~/.tradesim.env (KUBECTL etc.) and sets K.
+. scripts/lib.sh
 
 echo "==> namespaces"
 $K apply -f k8s/base/namespace.yaml

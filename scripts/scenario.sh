@@ -39,7 +39,7 @@ s1() {
 }
 
 s2() {
-  log "S2: decoy change event on portfolio, then ${DECOY_DELAY_S}s later account DB_MAX_POOL=3"
+  log "S2: decoy change event on portfolio, then ${DECOY_DELAY_S}s later account DB_MAX_POOL=2 DB_POOL_TIMEOUT_MS=500"
   "$here/change-event.sh" portfolio "tradesim-portfolio config: update logging format"
   left=$DECOY_DELAY_S
   while [ "$left" -gt 0 ]; do
@@ -48,7 +48,7 @@ s2() {
     sleep "$step"
     left=$(( left - step ))
   done
-  "$here/config.sh" account DB_MAX_POOL=3 "reduce DB connection pool"
+  "$here/config.sh" account DB_MAX_POOL=2 DB_POOL_TIMEOUT_MS=500 "reduce DB connection pool"
 }
 
 s3() {
@@ -58,7 +58,7 @@ s3() {
 }
 
 s4() {
-  log "S4: portfolio v1.0.1 (branch demo/portfolio-leak: ~1MB retained per request, 256Mi limit)"
+  log "S4: portfolio v1.0.1 (branch demo/portfolio-leak: ~0.5MB retained per request, latency grows with it, 256Mi limit)"
   "$here/deploy.sh" portfolio v1.0.1 "Cache recent portfolio responses" "${BUILD_REF}demo/portfolio-leak"
 }
 
