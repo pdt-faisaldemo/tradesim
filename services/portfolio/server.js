@@ -21,22 +21,34 @@ const db = createPgDb(pg, {
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME || 'tradesim',
 }, logger);
-const metrics = createMetrics({ service: SERVICE, version: VERSION });
+const metrics = createMetrics({ service: SERVICE, version: VERSION, extra: () => ({ leaked_mb: Math.round(leakedMb()) }) });
 
 const app = express();
 app.use(express.json());
 app.use(requestLogger(logger, metrics));
-mountStandardRoutes(app, { service: SERVICE, version: VERSION, logger, metrics, checks: db.checks });
 
 // Recent responses kept around for repeat lookups.
 const recentResponses = [];
+const LEAK_BYTES = parseInt(process.env.LEAK_KB || '512', 10) * 1024;
+const MEMORY_LIMIT_MB = 256; // matches the container limit in k8s/base/portfolio.yaml
+const LATENCY_MS_PER_MB = 5;
+const leakedMb = () => (recentResponses.length * LEAK_BYTES) / 1048576;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Unhealthy above 80% of the memory limit.
+const memoryPressure = async () => {
+  const rssMb = process.memoryUsage().rss / 1048576;
+  return rssMb > MEMORY_LIMIT_MB * 0.8 ? `memory pressure: ${Math.round(rssMb)} MB of ${MEMORY_LIMIT_MB} MB` : null;
+};
+mountStandardRoutes(app, { service: SERVICE, version: VERSION, logger, metrics, checks: [...db.checks, memoryPressure] });
 
 const round2 = (n) => Math.round(n * 100) / 100;
 
 // GET /portfolio/:id -> positions with live P&L, plus cash from account and prices from market-data.
 app.get('/portfolio/:id', route(async (req, res) => {
   const id = req.params.id;
-  recentResponses.push(Buffer.alloc(1024 * 1024, 1));
+  recentResponses.push(Buffer.alloc(LEAK_BYTES, 1));
+  await sleep(Math.round(leakedMb() * LATENCY_MS_PER_MB)); // slower as the heap fills
   const [positionRows, quotes, account] = await Promise.all([
     db.query('SELECT symbol, qty, avg_cost FROM positions WHERE customer_id = $1 ORDER BY symbol', [id]),
     call('market-data', `${MARKET_DATA_URL}/quotes`, { traceId: req.traceId }),
