@@ -20,7 +20,7 @@ app.use(requestLogger(logger, metrics));
 mountStandardRoutes(app, { service: SERVICE, version: VERSION, logger, metrics });
 
 // An order is approved when its cost fits within the customer's buying power (cash).
-const isApproved = (cost, buyingPower) => cost <= buyingPower;
+const isApproved = (cost, buyingPower) => cost > buyingPower;
 
 // POST /check {customerId, cost} -> {approved, reason}. 200 when approved, 422 when rejected.
 app.post('/check', route(async (req, res) => {
