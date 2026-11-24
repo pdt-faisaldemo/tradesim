@@ -32,14 +32,29 @@ data:
       avg_cost    numeric(14,4) NOT NULL,
       PRIMARY KEY (customer_id, symbol)
     );
-    -- Synthetic customers for loadgen. Separate from c-1001 so background traffic never drains the demo
+    -- Synthetic customers for loadgen (5 normally, up to 20 during S2). Separate from c-1001 so background traffic never drains the demo
     -- customer's cash; their balance is large enough to run for days.
     INSERT INTO accounts (id, name, cash) VALUES
       ('c-2001', 'Load Customer 1', 1000000000.00),
       ('c-2002', 'Load Customer 2', 1000000000.00),
       ('c-2003', 'Load Customer 3', 1000000000.00),
       ('c-2004', 'Load Customer 4', 1000000000.00),
-      ('c-2005', 'Load Customer 5', 1000000000.00)
+      ('c-2005', 'Load Customer 5', 1000000000.00),
+      ('c-2006', 'Load Customer 6', 1000000000.00),
+      ('c-2007', 'Load Customer 7', 1000000000.00),
+      ('c-2008', 'Load Customer 8', 1000000000.00),
+      ('c-2009', 'Load Customer 9', 1000000000.00),
+      ('c-2010', 'Load Customer 10', 1000000000.00),
+      ('c-2011', 'Load Customer 11', 1000000000.00),
+      ('c-2012', 'Load Customer 12', 1000000000.00),
+      ('c-2013', 'Load Customer 13', 1000000000.00),
+      ('c-2014', 'Load Customer 14', 1000000000.00),
+      ('c-2015', 'Load Customer 15', 1000000000.00),
+      ('c-2016', 'Load Customer 16', 1000000000.00),
+      ('c-2017', 'Load Customer 17', 1000000000.00),
+      ('c-2018', 'Load Customer 18', 1000000000.00),
+      ('c-2019', 'Load Customer 19', 1000000000.00),
+      ('c-2020', 'Load Customer 20', 1000000000.00)
     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, cash = EXCLUDED.cash, updated_at = now();
     -- Reset state, then c-1001's starting book: 10 positions and the 10 filled orders that built them, spread over
     -- the last 5 days. Cash stays 41870.00 (the history is illustrative, not replayed against the balance).

@@ -24,6 +24,10 @@ if state=$(chaos_get /state); then
     echo "REFUSED: scenario $active is already active (mode=$(printf '%s' "$state" | jq -r .mode)). Run scripts/reset.sh first (or FORCE=1)." >&2
     exit 3
   fi
+  if [ "$(printf '%s' "$state" | jq -r '.outcome // empty')" = fixed ] && [ "${FORCE:-0}" != 1 ]; then
+    echo "REFUSED: the last scenario was fixed but not reset. Run scripts/reset.sh first (or FORCE=1)." >&2
+    exit 3
+  fi
 else
   case "$id" in
     S3|COMBO) die "chaos-api is not reachable and $id needs it for the feedPaused flag (is k8s/platform/chaos-api.yaml deployed?)" ;;
@@ -39,7 +43,7 @@ s1() {
 }
 
 s2() {
-  log "S2: decoy change event on portfolio, then ${DECOY_DELAY_S}s later account DB_MAX_POOL=2 DB_POOL_TIMEOUT_MS=500"
+  log "S2: decoy change event on portfolio, then ${DECOY_DELAY_S}s later account DB_MAX_POOL=1 DB_POOL_TIMEOUT_MS=300 (each query holds its connection 1000ms), loadgen at 20 customers"
   "$here/change-event.sh" portfolio "tradesim-portfolio config: update logging format"
   left=$DECOY_DELAY_S
   while [ "$left" -gt 0 ]; do
@@ -48,7 +52,8 @@ s2() {
     sleep "$step"
     left=$(( left - step ))
   done
-  "$here/config.sh" account DB_MAX_POOL=2 DB_POOL_TIMEOUT_MS=500 "reduce DB connection pool"
+  chaos_post /flags '{"loadCustomers": 20}' >/dev/null || warn "could not raise loadgen to 20 customers (chaos-api unreachable)"
+  "$here/config.sh" account DB_MAX_POOL=1 DB_POOL_TIMEOUT_MS=300 "reduce DB connection pool"
 }
 
 s3() {

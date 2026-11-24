@@ -17,7 +17,7 @@ const config = {
   database: process.env.DB_NAME || 'tradesim',
   maxPool: parseInt(process.env.DB_MAX_POOL || '50', 10),
   poolTimeoutMs: parseInt(process.env.DB_POOL_TIMEOUT_MS || '2000', 10),
-  holdMs: parseInt(process.env.DB_QUERY_HOLD_MS || '300', 10),
+  holdMs: parseInt(process.env.DB_QUERY_HOLD_MS || '1000', 10),
 };
 
 const logger = createLogger({ service: SERVICE, version: VERSION });
@@ -103,10 +103,9 @@ async function main() {
     await db.connectOrThrow();
   } catch (err) {
     // Exit non-zero so Kubernetes shows CrashLoopBackOff; `logs --previous` ends with this line.
+    // stdout is synchronous for pipes on Linux, so the line is written before the process exits.
     logger.error(`${err.message}; exiting`);
-    process.stdout.write('', () => process.exit(1));
-    setTimeout(() => process.exit(1), 500).unref();
-    return;
+    process.exit(1);
   }
   setInterval(db.probe, 5000).unref();
   const server = app.listen(PORT, () => logger.info(`account listening on :${PORT}`));
