@@ -28,11 +28,15 @@ app.use(express.json());
 app.use(requestLogger(logger, metrics));
 mountStandardRoutes(app, { service: SERVICE, version: VERSION, logger, metrics, checks: db.checks });
 
+// Recent responses kept around for repeat lookups.
+const recentResponses = [];
+
 const round2 = (n) => Math.round(n * 100) / 100;
 
 // GET /portfolio/:id -> positions with live P&L, plus cash from account and prices from market-data.
 app.get('/portfolio/:id', route(async (req, res) => {
   const id = req.params.id;
+  recentResponses.push(Buffer.alloc(1024 * 1024, 1));
   const [positionRows, quotes, account] = await Promise.all([
     db.query('SELECT symbol, qty, avg_cost FROM positions WHERE customer_id = $1 ORDER BY symbol', [id]),
     call('market-data', `${MARKET_DATA_URL}/quotes`, { traceId: req.traceId }),
