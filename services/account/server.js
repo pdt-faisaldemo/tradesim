@@ -96,14 +96,16 @@ app.post('/accounts/:id/credit', async (req, res) => {
 
 async function main() {
   logger.info(
-    `starting account: DB_HOST=${config.host} DB_MAX_POOL=${config.maxPool} DB_POOL_TIMEOUT_MS=${config.poolTimeoutMs}`
+    `starting account: DB_HOST=${config.host} DB_MAX_POOL=${config.maxPool} DB_POOL_TIMEOUT_MS=${config.poolTimeoutMs}` +
+      (db.holdMs ? ` (query hold ${db.holdMs}ms)` : '')
   );
   try {
     await db.connectOrThrow();
   } catch (err) {
-    // Exit non-zero so Kubernetes shows CrashLoopBackOff; `logs --previous` keeps this line.
-    logger.error(err.message);
-    setTimeout(() => process.exit(1), 200);
+    // Exit non-zero so Kubernetes shows CrashLoopBackOff; `logs --previous` ends with this line.
+    logger.error(`${err.message}; exiting`);
+    process.stdout.write('', () => process.exit(1));
+    setTimeout(() => process.exit(1), 500).unref();
     return;
   }
   setInterval(db.probe, 5000).unref();

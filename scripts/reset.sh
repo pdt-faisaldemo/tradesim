@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Usage: reset.sh
-# Back to baseline: flags off, scenario cleared, every Deployment on its baseline image (gateway v1.0.0-ui1, the rest
-# v1.0.0) with baseline ConfigMaps and no env overrides, database reseeded (c-1001 cash 41870.00, no orders or
-# positions), open incidents on the TradeSim services resolved. Prints ALL HEALTHY when every /health is 200.
+# Back to baseline: flags off, scenario cleared, every Deployment on its baseline image (gateway v1.0.0-ui3, the rest
+# v1.0.0) with baseline ConfigMaps (account DB_MAX_POOL=50, DB_POOL_TIMEOUT_MS=2000) and no env overrides, database
+# reseeded (c-1001 cash 41870.00 with 10 positions and 10 orders), incident panel state cleared (scenario state
+# reset + gateway restart), open incidents on the TradeSim services resolved. Prints ALL HEALTHY when every /health is 200.
 # Idempotent. Target: under 60s.
 set -uo pipefail
 here=$(dirname "$0")

@@ -265,15 +265,17 @@ function portfolioPage(root) {
   let have = false;
 
   every(3000, async () => {
+    const started = performance.now();
     try {
       const p = await api(`/api/portfolio/${CUSTOMER_ID}`);
+      const loadedMs = Math.round(performance.now() - started);
       have = true;
       clear(stats).append(
         stat('Account value', money(p.totals.accountValue), p.name),
         stat('Positions value', money(p.totals.positionsValue)),
         stat('Cash', money(p.cash)),
         stat('Unrealised P&L', signed(p.totals.pnl), null, p.totals.pnl >= 0 ? 'up' : 'down'));
-      positions.right.textContent = `Prices as of ${clock(p.asOf)}`;
+      positions.right.textContent = `Prices as of ${clock(p.asOf)} · Loaded in ${loadedMs} ms`;
       showTable(positions, [['Symbol'], ['Qty', true], ['Avg cost', true], ['Price', true], ['Value', true], ['P&L', true], ['P&L %', true]],
         p.positions.map((x) => {
           const cls = x.pnl >= 0 ? 'up' : 'down';
@@ -287,12 +289,14 @@ function portfolioPage(root) {
         'You do not hold any positions yet. Head to Trade to buy your first shares.');
     } catch (err) {
       if (!have) clear(stats);
+      positions.right.textContent = `Failed after ${Math.round(performance.now() - started)} ms`;
       showError(positions, err, have);
     }
   });
 }
 
 const PAGES = { dashboard: dashboardPage, trade: tradePage, portfolio: portfolioPage };
+const PANEL_PAGES = new Set(['dashboard', 'trade', 'portfolio']);
 
 function route() {
   const page = (location.hash.match(/^#\/(\w+)/) || [])[1];
@@ -301,6 +305,7 @@ function route() {
   const root = clear(document.getElementById('app'));
   document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.page === name));
   document.title = `TradeSim – ${name[0].toUpperCase()}${name.slice(1)}`;
+  document.getElementById('dock').hidden = !PANEL_PAGES.has(name);
   PAGES[name](root);
 }
 
@@ -337,6 +342,114 @@ async function pollStatus() {
   }
 }
 
+// ---------- floating panels: incident status (right) and reliability delivered (left) ----------
+// State comes from /api/incident-panel (the gateway polls PagerDuty every 5s). Time and cost tick locally each second.
+const incidentEl = document.getElementById('incident-panel');
+const deliveredEl = document.getElementById('delivered-panel');
+const BLOCK_STAGGER_MS = 600;
+
+let panelData = null;
+let panelKey = null; // last painted content, so an unchanged poll does not rebuild the DOM
+let panelClockSkew = 0; // server clock minus browser clock
+let live = null; // text nodes updated every second while an incident is open
+let deliveredShown = false;
+let deliveredTimers = [];
+
+const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+const usd0 = (n) => usd.format(Math.round(n)).replace(/\.00$/, '');
+
+function paintIncidentPanel() {
+  const d = panelData;
+  live = null;
+  clear(incidentEl);
+  incidentEl.className = 'panel panel-right';
+  if (!d || d.phase === 'healthy') {
+    incidentEl.classList.add('pill');
+    incidentEl.append(h('span', { class: 'dot ok', 'aria-hidden': 'true' }), 'All systems operational · Monitored by PagerDuty');
+    return;
+  }
+  const resolved = d.phase === 'resolved';
+  const m = d.metrics;
+  const revenue = h('div', { class: 'v' }, usd0(m.revenueAtRisk));
+  const time = h('div', { class: 'v' }, mmss(m.timeToResolveS));
+  const engineers = h('div', { class: 'v' }, String(m.engineers));
+  const cost = h('div', { class: 'v' }, usd0(m.cost));
+  const metric = (label, v) => h('div', { class: 'ip-metric' }, h('div', { class: 'k' }, label), v);
+
+  const steps = d.timeline.map((t) => h('li', { class: t.elapsedS == null ? '' : 'done' },
+    h('span', { class: 'mark', 'aria-hidden': 'true' }, t.elapsedS == null ? '○' : '✓'),
+    h('span', {}, t.label),
+    h('span', { class: 't' }, t.elapsedS == null ? '--' : mmss(t.elapsedS)),
+    t.detail ? h('span', { class: 'd' }, t.detail) : null));
+
+  incidentEl.append(h('div', { class: `ipanel ${resolved ? 'resolved' : 'incident'}`, role: 'status' },
+    h('div', { class: 'ip-head' }, h('span', {}, 'TradeSim incident'), h('span', { class: 'ip-chip' }, resolved ? 'RESOLVED' : 'IN PROGRESS')),
+    h('div', { class: 'ip-metrics' },
+      metric('Revenue at risk', revenue), metric('Time to resolve', time),
+      metric('Engineers engaged', engineers), metric('Cost of response', cost)),
+    h('div', { class: 'ip-section' }, h('h3', {}, 'Investigation led by Paige'), h('ol', { class: 'ip-steps' }, steps)),
+    h('div', { class: 'ip-compare' }, `Typical without AI (illustrative): ${d.comparison}`),
+    resolved ? h('div', { class: 'ip-checks' }, h('span', {}, '✓ Detect'), h('span', {}, '✓ Resolve'), h('span', {}, '✓ Prevent')) : null,
+    resolved ? h('div', { class: 'ip-foot' }, 'PagerDuty Reliability Platform') : null));
+
+  if (!resolved) live = { revenue, time, cost, engineers };
+  tickIncidentPanel();
+}
+
+// Extrapolates between polls: elapsed time, cost, and revenue while the order service is unhealthy.
+function tickIncidentPanel() {
+  const d = panelData;
+  if (!live || !d || d.phase !== 'incident') return;
+  const nowServer = Date.now() + panelClockSkew;
+  const sinceSnapshotS = Math.max(0, (nowServer - d.serverNow) / 1000);
+  const elapsedS = Math.max(0, (nowServer - d.startedAt) / 1000);
+  const revenue = d.metrics.revenueAtRisk + (d.live.orderUnhealthy ? sinceSnapshotS * d.live.revenuePerS : 0);
+  live.revenue.textContent = usd0(revenue);
+  live.time.textContent = mmss(elapsedS);
+  live.cost.textContent = usd0(d.metrics.engineers * (elapsedS / 60) * d.live.hourlyRate);
+}
+
+function paintDeliveredPanel() {
+  const d = panelData;
+  if (!d || d.phase !== 'resolved' || !d.delivered) {
+    // Back to healthy (reset): hide and rearm.
+    deliveredTimers.forEach(clearTimeout);
+    deliveredTimers = [];
+    deliveredShown = false;
+    deliveredEl.hidden = true;
+    clear(deliveredEl);
+    return;
+  }
+  if (deliveredShown) return; // stays as it is until reset
+  deliveredShown = true;
+  const blocks = d.delivered.blocks.map((b) => h('div', { class: 'dp-block' },
+    h('span', { class: 'dp-check', 'aria-hidden': 'true' }, '✓'),
+    h('span', { class: 'dp-label' }, b.title),
+    h('span', { class: 'dp-headline' }, b.headline),
+    h('span', { class: 'dp-value' }, b.value)));
+  clear(deliveredEl).append(h('div', { class: 'dpanel' },
+    h('div', { class: 'dp-title' }, 'Reliability delivered'), blocks,
+    h('div', { class: 'dp-foot' }, 'PagerDuty Reliability Platform')));
+  deliveredEl.hidden = false;
+  blocks.forEach((el, i) => deliveredTimers.push(setTimeout(() => el.classList.add('in'), 50 + i * BLOCK_STAGGER_MS)));
+}
+
+async function pollIncidentPanel() {
+  let d;
+  try {
+    d = await api('/api/incident-panel');
+  } catch {
+    return; // keep showing the last known state rather than flashing
+  }
+  panelClockSkew = d.serverNow - Date.now();
+  const phaseChanged = !panelData || panelData.phase !== d.phase;
+  const { serverNow, ...content } = d;
+  const key = JSON.stringify(content);
+  panelData = d;
+  if (key !== panelKey) { panelKey = key; paintIncidentPanel(); }
+  if (phaseChanged || d.phase === 'healthy') paintDeliveredPanel();
+}
+
 // ---------- theme ----------
 document.getElementById('theme-toggle').addEventListener('click', () => {
   const root = document.documentElement;
@@ -351,5 +464,8 @@ pollHealth();
 pollStatus();
 setInterval(pollHealth, 3000);
 setInterval(pollStatus, 3000);
+pollIncidentPanel();
+setInterval(pollIncidentPanel, 3000);
+setInterval(tickIncidentPanel, 1000);
 window.addEventListener('hashchange', route);
 route();

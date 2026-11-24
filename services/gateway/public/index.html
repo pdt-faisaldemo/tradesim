@@ -28,6 +28,12 @@
 
   <main id="app" aria-live="polite"></main>
 
+  <!-- Floating panels (Dashboard, Trade and Portfolio only). Left: Reliability delivered. Right: incident status. -->
+  <div id="dock" class="dock" hidden>
+    <aside id="delivered-panel" class="panel panel-left" aria-label="Reliability delivered" hidden></aside>
+    <aside id="incident-panel" class="panel panel-right" aria-label="Incident status"></aside>
+  </div>
+
   <footer class="footer">
     <div id="health-strip" class="health-strip" aria-label="Service health"></div>
     <div class="sim-note">Simulated market data. Not real prices and not investment advice.</div>

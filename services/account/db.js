@@ -2,6 +2,8 @@
 const { Pool, Client } = require('pg');
 
 const POOL_EXHAUSTED_RE = /timeout exceeded when trying to connect/;
+const HOLD_BELOW_POOL_SIZE = 10;
+const CONNECT_RETRY_MS = 5000;
 
 class PoolExhaustedError extends Error {
   constructor(inUse, max, waitedMs) {
@@ -13,6 +15,8 @@ class PoolExhaustedError extends Error {
 function createDb(config, logger) {
   const { host, port, user, password, database, maxPool, poolTimeoutMs, holdMs } = config;
   const connOpts = { host, port, user, password, database };
+  // The hold only exists to saturate a deliberately tiny pool (S2); at the baseline pool size it would just add latency.
+  const effectiveHoldMs = maxPool < HOLD_BELOW_POOL_SIZE ? holdMs : 0;
 
   const pool = new Pool({
     ...connOpts,
@@ -51,7 +55,9 @@ function createDb(config, logger) {
     }
   }
 
-  async function connectOrThrow(attempts = 3) {
+  // One retry after 5s, then throw. Each failure is logged as "cannot connect to DB_HOST=<host>" so the cause
+  // is the last thing `kubectl logs --previous` shows after the crash (scenario S5).
+  async function connectOrThrow(attempts = 2) {
     let last;
     for (let i = 1; i <= attempts; i++) {
       const client = new Client({ ...connOpts, connectionTimeoutMillis: 2000 });
@@ -63,15 +69,17 @@ function createDb(config, logger) {
       } catch (err) {
         last = err;
         client.end().catch(() => {});
-        logger.warn(`cannot connect to DB_HOST=${host}: ${err.message} (attempt ${i}/${attempts})`);
-        if (i < attempts) await new Promise((r) => setTimeout(r, 1000));
+        const more = i < attempts;
+        logger.error(`cannot connect to DB_HOST=${host}: ${err.message}${more ? ` (attempt ${i}/${attempts}, retrying in ${CONNECT_RETRY_MS / 1000}s)` : ` (attempt ${i}/${attempts}, giving up)`}`);
+        if (more) await new Promise((r) => setTimeout(r, CONNECT_RETRY_MS));
       }
     }
     throw new Error(`cannot connect to DB_HOST=${host}: ${last.message}`);
   }
 
-  // Runs one query on a pooled connection. Each query holds its connection for holdMs
-  // (pg_sleep) so a small DB_MAX_POOL saturates under steady traffic (scenario S2).
+  // Runs one query on a pooled connection. When the pool is tiny, each query holds its connection for holdMs
+  // (pg_sleep) so it saturates under steady traffic (scenario S2). A connection not acquired within
+  // DB_POOL_TIMEOUT_MS throws PoolExhaustedError, which the routes turn into a 503.
   async function query(sql, params) {
     const waitStart = Date.now();
     let client;
@@ -79,12 +87,12 @@ function createDb(config, logger) {
       client = await pool.connect();
     } catch (err) {
       if (POOL_EXHAUSTED_RE.test(err.message)) {
-        throw new PoolExhaustedError(inUse(), maxPool, Date.now() - waitStart);
+        throw new PoolExhaustedError(inUse(), maxPool, Math.min(Date.now() - waitStart, poolTimeoutMs));
       }
       throw err;
     }
     try {
-      if (holdMs > 0) await client.query('SELECT pg_sleep($1)', [holdMs / 1000]);
+      if (effectiveHoldMs > 0) await client.query('SELECT pg_sleep($1)', [effectiveHoldMs / 1000]);
       return await client.query(sql, params);
     } finally {
       client.release();
@@ -95,6 +103,7 @@ function createDb(config, logger) {
     query,
     probe,
     connectOrThrow,
+    holdMs: effectiveHoldMs,
     stats: () => ({ db_pool_in_use: inUse(), db_pool_max: maxPool, db_pool_waiting: pool.waitingCount }),
     // /health checks: DB unreachable, or pool saturated for more than 10s.
     checks: [

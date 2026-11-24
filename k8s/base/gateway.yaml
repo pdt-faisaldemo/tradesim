@@ -14,12 +14,20 @@ spec:
     spec:
       containers:
         - name: gateway
-          image: ghcr.io/pdt-faisaldemo/tradesim-gateway:v1.0.0-ui1
+          image: ghcr.io/pdt-faisaldemo/tradesim-gateway:v1.0.0-ui3
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
           envFrom:
             - configMapRef: {name: tradesim-gateway-config}
+          # Optional: without them the incident panel falls back to the health summary.
+          env:
+            - name: PD_API_TOKEN
+              valueFrom:
+                secretKeyRef: {name: tradesim-secrets, key: PD_API_TOKEN, optional: true}
+            - name: PD_SERVICE_IDS
+              valueFrom:
+                secretKeyRef: {name: tradesim-secrets, key: PD_SERVICE_IDS, optional: true}
           # TCP only on purpose: gating readiness on /health would pull the pod out of the Service
           # and hide the very symptoms the demo is about.
           readinessProbe:

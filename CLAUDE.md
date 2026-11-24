@@ -60,9 +60,9 @@ account: `DB_HOST=postgres`, `DB_MAX_POOL=50`, `DB_POOL_TIMEOUT_MS=2000`. Others
 | ID | Type | Mechanism | Expected symptom |
 |---|---|---|---|
 | S1 | Code | Image `risk:v1.0.1` built from branch `demo/bad-risk-check`: `return cost > buyingPower` (inverted) | Valid orders rejected "insufficient buying power"; risk/order error-rate alerts |
-| S2 | Config | ConfigMap account `DB_MAX_POOL=3` + restart; each account query holds the connection ~300ms (`pg_sleep(0.3)`) so loadgen saturates it. Decoy first: change event on portfolio "update logging format" 60s earlier | account pool exhausted -> risk, order, gateway, portfolio error. Deepest cascade |
+| S2 | Config | ConfigMap account `DB_MAX_POOL=2` + `DB_POOL_TIMEOUT_MS=500` + restart; below pool size 10 each account query holds the connection ~300ms (`pg_sleep(0.3)`) so loadgen saturates it, and a connection not acquired in 500ms returns 503 "db pool exhausted: 2/2 in use, waited 500ms". Decoy first: change event on portfolio "update logging format" 60s earlier | account pool exhausted -> risk, order, gateway, portfolio error. Deepest cascade |
 | S3 | Silent | Flag `feedPaused=true` (market-data polls chaos-api `GET /flags` every 5s) stops ticks; quotes still served | No errors; prices + "Prices as of" freeze; `last_tick_age_s` grows; freshness alert |
-| S4 | Memory leak | Image `portfolio:v1.0.1` from branch `demo/portfolio-leak`: appends ~1MB per request to a module-level array; memory limit 256Mi | Slow, then OOMKilled restarts; restart/OOM alerts |
+| S4 | Memory leak | Image `portfolio:v1.0.1` from branch `demo/portfolio-leak`: appends ~0.5MB per request to a module-level array (`LEAK_KB`), adds ~5ms latency per leaked MB, `/health` 503 "memory pressure" above 80% of 256Mi; memory limit 256Mi | Visible slowdown, then OOMKilled restarts about 2-3 min under loadgen; restart/OOM alerts |
 | S5 | k8s config | Patch account Deployment env `DB_HOST=postgress` (typo) | account CrashLoopBackOff; everything downstream fails; `logs --previous` shows the cause |
 | S1R/S4R | Repeat | Same as S1/S4; fixed by "Deploy known fix" to `v1.0.2` (Devin's fix, built later) | Same symptoms |
 
