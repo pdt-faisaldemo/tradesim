@@ -1,0 +1,10 @@
+# Baseline copy: scripts/reset.sh re-applies this file.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tradesim-account-config
+  namespace: tradesim
+data:
+  DB_HOST: "postgres"
+  DB_MAX_POOL: "50"
+  DB_POOL_TIMEOUT_MS: "2000"

@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: tradesim
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path   # k3s default
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: tradesim
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - {name: POSTGRES_USER, value: tradesim}
+            - {name: POSTGRES_DB, value: tradesim}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: tradesim-secrets, key: DB_PASSWORD}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "tradesim", "-d", "tradesim"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: postgres-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: tradesim
+spec:
+  selector: {app: postgres}
+  ports:
+    - {port: 5432, targetPort: 5432}

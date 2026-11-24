@@ -1,0 +1,45 @@
+# Jobs are immutable: delete before re-applying (bootstrap.sh and reset.sh do).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tradesim-seed-sql
+  namespace: tradesim
+data:
+  seed.sql: |
+    CREATE TABLE IF NOT EXISTS accounts (
+      id         text PRIMARY KEY,
+      name       text NOT NULL,
+      cash       numeric(14,2) NOT NULL CHECK (cash >= 0),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+    INSERT INTO accounts (id, name, cash) VALUES ('c-1001', 'Jordan Lee', 41870.00)
+    ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, cash = EXCLUDED.cash, updated_at = now();
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed
+  namespace: tradesim
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: postgres:16-alpine
+          command: ["sh", "-c"]
+          args:
+            - |
+              until pg_isready -h postgres -U tradesim -d tradesim; do echo "waiting for postgres"; sleep 2; done
+              psql -v ON_ERROR_STOP=1 -h postgres -U tradesim -d tradesim -f /seed/seed.sql
+              echo "seed complete"
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: {name: tradesim-secrets, key: DB_PASSWORD}
+          volumeMounts:
+            - {name: seed, mountPath: /seed}
+      volumes:
+        - name: seed
+          configMap: {name: tradesim-seed-sql}

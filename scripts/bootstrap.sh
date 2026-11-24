@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Idempotent first-time setup + (re)apply of everything in k8s/base. Safe to re-run.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+K=${KUBECTL:-kubectl}
+
+echo "==> namespaces"
+$K apply -f k8s/base/namespace.yaml
+
+echo "==> secret tradesim-secrets (tradesim namespace)"
+if $K -n tradesim get secret tradesim-secrets >/dev/null 2>&1; then
+  echo "exists, leaving as is"
+else
+  PW=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)
+  $K -n tradesim create secret generic tradesim-secrets --from-literal=DB_PASSWORD="$PW"
+  echo "created with a generated DB_PASSWORD"
+fi
+
+echo "==> configmaps"
+$K apply -f k8s/base/configmaps/
+
+echo "==> postgres"
+$K apply -f k8s/base/postgres.yaml
+$K -n tradesim rollout status deploy/postgres --timeout=120s
+
+echo "==> seed job"
+$K -n tradesim delete job seed --ignore-not-found
+$K apply -f k8s/base/seed-job.yaml
+$K -n tradesim wait --for=condition=complete job/seed --timeout=120s
+
+echo "==> account"
+$K apply -f k8s/base/account.yaml
+$K -n tradesim rollout status deploy/account --timeout=120s
+echo "bootstrap done"

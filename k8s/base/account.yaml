@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: account
+  namespace: tradesim
+  labels: {app: account}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: account}
+  template:
+    metadata:
+      labels: {app: account}
+    spec:
+      containers:
+        - name: account
+          image: ghcr.io/pdt-faisaldemo/tradesim-account:v1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8083
+          # DB_HOST / DB_MAX_POOL / DB_POOL_TIMEOUT_MS come from the ConfigMap. Scenario S5 adds a
+          # DB_HOST env entry on this Deployment (which wins over envFrom); reset removes it.
+          envFrom:
+            - configMapRef: {name: tradesim-account-config}
+          env:
+            - {name: DB_USER, value: tradesim}
+            - {name: DB_NAME, value: tradesim}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: tradesim-secrets, key: DB_PASSWORD}
+          # TCP only on purpose: gating readiness on /health would pull the pod out of the Service
+          # during S2 (pool saturation) and hide the very symptom the demo is about.
+          readinessProbe:
+            tcpSocket: {port: 8083}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: account
+  namespace: tradesim
+spec:
+  selector: {app: account}
+  ports:
+    - {port: 8083, targetPort: 8083}
