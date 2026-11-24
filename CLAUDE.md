@@ -69,7 +69,7 @@ account: `DB_HOST=postgres`, `DB_MAX_POOL=50`, `DB_POOL_TIMEOUT_MS=2000`. Others
 Images: `v1.0.0` good (main), `v1.0.1` bad (demo branch), `v1.0.2` Devin fix (built after Devin's PR merges). Registry: `ghcr.io/<owner>/tradesim-<service>:<tag>` (public packages).
 
 ## Scripts (all idempotent, all print what they do)
-- `scripts/change-event.sh <service> "<summary>" [link_url]` -> POST `https://events.pagerduty.com/v2/change/enqueue` with the routing key from env `PD_KEY_<SERVICE>`.
+- `scripts/change-event.sh <service> "<summary>" [link_url]` -> POST `https://events.pagerduty.com/v2/change/enqueue` with `custom_details.service=<service>`. Routing key: `PD_CHANGE_KEY_<SERVICE>` if set (per-service Change Events integration), otherwise `PD_ROUTING_KEY` (global orchestration). Support both.
 - `scripts/deploy.sh <service> <tag> "<summary>" [commit_url]` -> `kubectl -n tradesim set image deploy/<service> <service>=<image>:<tag>`, wait rollout (60s timeout, non-fatal for S4/S5), send change event.
 - `scripts/config.sh <service> KEY=VALUE "<summary>"` -> patch ConfigMap, rollout restart, change event "tradesim-<service> config: KEY old -> new".
 - `scripts/scenario.sh <S1|S2|S3|S4|S5|COMBO> [quick|deep]` -> performs the fault (incl. decoy for S2), refuses if another scenario is active (state in chaos-api).
@@ -83,7 +83,7 @@ Images: `v1.0.0` good (main), `v1.0.1` bad (demo branch), `v1.0.2` Devin fix (bu
 - market-data last_tick_age_s > 30 -> critical ("price feed stale")
 - restart count increased or OOMKilled -> critical
 - CrashLoopBackOff -> critical
-Send Events API v2 `trigger` with `dedup_key = <service>:<check>`, `source = tradesim-k3s`, `component = <service>`, `custom_details` {check, threshold, value, sample_log (last error line, fetched from the service's `/debug/last-error`), demo_mode (from chaos-api)}. Send `resolve` after 2 healthy cycles. Routing keys from Secret `pagerduty-keys` (`PD_KEY_GATEWAY`, ...). Log every send.
+Send Events API v2 `trigger` with `dedup_key = <service>:<check>`, `source = tradesim-k3s`, `component = <service>`, `custom_details` {check, threshold, value, sample_log (last error line, fetched from the service's `/debug/last-error`), demo_mode (from chaos-api)}. Send `resolve` after 2 healthy cycles. All alerts go to ONE Global Event Orchestration routing key (`PD_ROUTING_KEY`); PagerDuty routes them to the right service by `payload.component` (rules are configured in PagerDuty, not in code). Always set `component` to the bare service name (gateway, order, risk, account, portfolio, market-data, postgres, redis) and also put it in `custom_details.service`. Log every send.
 
 **chaos-api** (namespace platform, ServiceAccount with patch on deployments/configmaps/jobs in tradesim; image includes kubectl + scripts/): 
 - `GET /flags`, `GET /state` (active scenario, mode)
@@ -110,7 +110,7 @@ Pages: Dashboard (cash, account value, market watch with "Prices as of HH:MM:SS"
 - `reset.sh`: calls scripts/reset.sh.
 
 ## Environment / secrets (Secret `tradesim-secrets` in tradesim and platform)
-`PD_KEY_<SERVICE>` for gateway, order, risk, account, portfolio, market-data, postgres, redis; `PD_API_TOKEN`; `PD_FROM_EMAIL`; `PD_SERVICE_IDS` (comma list); `OPS_USER`; `OPS_PASSWORD`; `GHCR_OWNER`; `GITHUB_REPO_URL`; `AWS_REGION`.
+`PD_ROUTING_KEY` (Global Event Orchestration); optional `PD_CHANGE_KEY_<SERVICE>` per service for change events; `PD_API_TOKEN`; `PD_FROM_EMAIL`; `PD_SERVICE_IDS` (comma list); `OPS_USER`; `OPS_PASSWORD`; `GHCR_OWNER`; `GITHUB_REPO_URL`; `AWS_REGION`.
 
 ## Definition of done (whole project)
 1. Happy path: buy succeeds, portfolio and prices update, all 6 health dots green.
