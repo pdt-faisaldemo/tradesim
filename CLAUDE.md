@@ -40,7 +40,7 @@ rundeck/          # job scripts: diagnose.sh, restart.sh, rollback.sh, restore-c
 | portfolio | 8084 | market-data, account | positions table | `GET /portfolio/:id` positions + live P&L + cash |
 | market-data | 8085 | redis | price simulator | `GET /quotes` -> `{asOf, prices}`; ticks every 2s into Redis |
 
-Demo customer id `c-1001`, name Jordan Lee, starting cash 41870.00. About 10 tickers (NVDA, AAPL, MSFT, AMZN, GOOGL, META, TSLA, JPM, V, NFLX) with random-walk prices.
+Demo customer id `c-1001`, name Jordan Lee, starting cash 41870.00. Fifteen tickers with random-walk prices: AMZN, NVDA, ANTH (Anthropic, simulated private-company listing), IBM, AMD, INTC, META, CRM, SNOW, CRWD, PANW (Palo Alto Networks), ANET (Arista Networks), NBIS (Nebius), CRWV (CoreWeave), NFLX. Do NOT include Microsoft, Google/Alphabet, Oracle, Alibaba or PagerDuty anywhere (tickers, sample data, copy): the demo is shown at AWS re:Invent. Starting prices: AMZN 225.40, NVDA 184.22, ANTH 312.00, IBM 268.10, AMD 158.30, INTC 38.20, META 712.40, CRM 312.55, SNOW 214.80, CRWD 476.20, PANW 201.30, ANET 142.70, NBIS 98.40, CRWV 124.60, NFLX 1102.50. Show a small 'simulated market data' note in the UI footer.
 
 Inter-service calls: `shared/http.js` with a 2s timeout; on downstream failure return 502/503 with `{error, upstream, traceId}` and log it. This is what creates visible cascades. Propagate an `x-trace-id` header.
 
