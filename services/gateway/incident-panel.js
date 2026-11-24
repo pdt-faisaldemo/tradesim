@@ -1,24 +1,34 @@
 'use strict';
-// Incident panel state for the UI: one in-memory state machine (healthy -> incident -> resolved), refreshed every 5s.
+// Incident panel state for the UI: one in-memory state machine (healthy -> incident -> resolved), refreshed every 5s,
+// plus a 'resetting' phase while scripts/reset.sh runs. The status banner and the health dots follow this same state.
 //
-// Inputs: chaos-api /state (active scenario; no scenario = nothing to show, state cleared), the health sampler
-// (health failing or error rate over threshold), and the PagerDuty REST API (incidents, notes, log entries, change
-// events) when PD_API_TOKEN and PD_SERVICE_IDS are set. Without them, or when the API fails, it falls back to the
-// sampler alone. Reset clears the scenario in chaos-api (and restarts the gateway), which clears this state.
+// Inputs: chaos-api /state (active scenario, resetting flag, outcome), the health sampler (health failing or error
+// rate over threshold), and the PagerDuty REST API (incidents, notes, log entries, change events) when PD_API_TOKEN
+// and PD_SERVICE_IDS are set.
+//
+// Resolving: while a scenario is active, health alone never resolves an incident. It ends when the PagerDuty incident
+// is resolved (needs the API token), or when the scenario is cleared: by a fix (chaos-api outcome 'fixed', set by
+// scripts/clear-scenario.sh from the Rundeck fix jobs) which shows Resolved, or by reset.sh which returns to healthy.
+// Only when no scenario is known (chaos-api unreachable) does health alone resolve, after 60 healthy seconds.
 
-const TICK_MS = 5000;
+const TICK_MS = 2000; // state machine; PagerDuty is polled every PD_POLL_MS
+const PD_POLL_MS = 5000;
 const CHAOS_TIMEOUT_MS = 1500;
 const PD_TIMEOUT_MS = 4000;
 const PD_BASE = 'https://api.pagerduty.com';
-// Healthy ticks in a row, and minimum incident age, before an incident counts as resolved. Guards against a quiet
-// gap between the first blip (a rollout, a restart) and the real symptom. With PagerDuty, at least one incident
-// must also exist and be resolved; the stricter fallback numbers compensate for that missing signal.
-const STABLE_TICKS = { pagerduty: 2, 'health-summary': 6 };
-const MIN_INCIDENT_S = { pagerduty: 30, 'health-summary': 45 };
+// With PagerDuty, an incident must exist, none may be open for PD_STABLE_MS, and the incident must be at
+// least MIN_INCIDENT_S old: guards against a short-lived incident from the first blip (a rollout) resolving the panel.
+const PD_STABLE_MS = 10000;
+const MIN_INCIDENT_S = 30;
+const HEALTH_ONLY_RESOLVE_S = 60; // consecutive healthy seconds, only when no scenario is known
+const RESET_ERROR_GRACE_MS = 35000; // error rates in the 30s window still describe the old fault right after a reset
+// A restart this long after the incident began, before any fix, is the platform restarting a crashing pod.
+const RESTART_NOTE_AFTER_S = 30;
 const MAX_NOTE_CHARS = 60;
 const FAILED_ORDER_KEEP_MS = 30 * 60 * 1000;
 
 const ROOT_CAUSE_NOTE = /^\s*SRE Agent:\s*/i;
+const PANEL_SUMMARY_LINE = /^\s*Panel summary:\s*/i;
 const FIX_CHANGE_EVENT = /\bfix|rollback|rolled back|\[INC\]/i;
 // A Rundeck / automation job run on the incident. Diagnose runs automatically and is not the approved fix.
 const AUTOMATION_ENTRY = /rundeck|runbook|process automation|automation action|action_invocation|invoke_action/i;
@@ -42,18 +52,41 @@ const GENERIC_HEADLINES = ['Several failing signals traced to their root cause',
 
 const ts = (iso) => Date.parse(iso) || null;
 
+// At most `max` characters including the ellipsis, cut at a word boundary.
+function clip(text, max) {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max - 1);
+  const space = cut.lastIndexOf(' ');
+  return `${(space > 0 ? cut.slice(0, space) : cut).replace(/[\s,;:.-]+$/, '')}…`;
+}
+
+// The "Panel summary:" line of an "SRE Agent:" note, or null when the note has none.
+function panelSummary(content) {
+  const body = content.replace(ROOT_CAUSE_NOTE, '');
+  const line = body.split('\n').find((l) => PANEL_SUMMARY_LINE.test(l));
+  const text = line && line.replace(PANEL_SUMMARY_LINE, '').trim();
+  return text ? clip(text, MAX_NOTE_CHARS) : null;
+}
+
+// Only link to PagerDuty over https.
+const safeUrl = (u) => { try { return new URL(u).protocol === 'https:' ? u : null; } catch { return null; } };
+
+const STALE_FEED_S = 30; // a price older than this makes a fill a "trade at a stale price" (market-data last_tick_age_s)
+const STALE_SCENARIOS = new Set(['S3', 'COMBO']);
+
 function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, pd, config, logger }) {
   // pd: { token, serviceIds[] }; config: { revenuePerS, hourlyRate, defaultEngineers, comparison }
   const bootAt = Date.now();
   const pdEnabled = Boolean(pd.token && pd.serviceIds.length);
   let st = fresh();
-  let tickNo = 0;
+  let resetting = false;
 
   function fresh() {
     return {
       phase: 'healthy', startedAt: null, resolvedAt: null, scenario: null, mode: null, source: pdEnabled ? 'pagerduty' : 'health-summary',
       lastTickAt: null, healthyTicks: 0, healthySince: null, orderUnhealthyMs: 0, orderUnhealthyNow: false,
-      engineers: new Set(), failedOrders: [], incidents: [], detectedAt: null, rootCause: null, rootCauseAt: null, fixAt: null,
+      engineers: new Set(), failedOrders: [], staleTrades: [], incidents: [], detectedAt: null,
+      rootCause: null, rootCauseAt: null, rootCauseUrl: null, fixAt: null, restartAt: null,
       frozen: null,
     };
   }
@@ -94,13 +127,14 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
   // Notes and log entries are only looked up while something is still missing, and every other tick.
   async function enrichFromPagerDuty(incidents) {
     for (const inc of incidents.slice(0, 5)) {
-      if (!st.rootCause) {
+      if (!st.rootCauseAt) {
         const { notes = [] } = await pdGet(`/incidents/${inc.id}/notes`);
         const note = notes.filter((n) => ROOT_CAUSE_NOTE.test(n.content || '')).sort((a, b) => ts(a.created_at) - ts(b.created_at))[0];
         if (note) {
-          const line = note.content.replace(ROOT_CAUSE_NOTE, '').split('\n').map((l) => l.trim()).find(Boolean) || '';
-          st.rootCause = line.length > MAX_NOTE_CHARS ? `${line.slice(0, MAX_NOTE_CHARS - 1)}…` : line;
+          // The step shows the note's "Panel summary:" line; a note without one falls back to the scenario's preset text.
+          st.rootCause = panelSummary(note.content) || presetHeadlines()[0];
           st.rootCauseAt = ts(note.created_at);
+          st.rootCauseUrl = safeUrl(inc.html_url);
         }
       }
       if (!st.fixAt) {
@@ -133,14 +167,56 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
     try { await runTick(); } finally { busy = false; }
   }
 
+  // PagerDuty is polled every PD_POLL_MS even though the state machine ticks faster (to notice a reset quickly).
+  const pdCache = { at: 0, incidents: null, since: null, fetches: 0 };
+  async function pagerDutyIncidents(since, now) {
+    if (!pdEnabled) return null;
+    if (now - pdCache.at < PD_POLL_MS && pdCache.since === since) return pdCache.incidents;
+    pdCache.at = now;
+    pdCache.since = since;
+    try {
+      pdCache.incidents = await fetchIncidents(since);
+      pdCache.fetches++;
+    } catch (err) {
+      pdCache.incidents = null;
+      logger.warn(`incident panel: PagerDuty unavailable, using health summary: ${err.message}`);
+    }
+    return pdCache.incidents;
+  }
+
+  function resolveNow(at, why) {
+    st.resolvedAt = at;
+    st.phase = 'resolved';
+    st.frozen = measure(at);
+    logger.info(`incident panel: resolved (${why}) after ${Math.round((at - st.startedAt) / 1000)}s scenario=${st.scenario}`);
+  }
+
   async function runTick() {
-    tickNo++;
     const now = Date.now();
     const chaos = await fetchChaos();
+    if (chaos && chaos.resetting) {
+      if (!resetting) logger.info('incident panel: reset in progress');
+      resetting = true;
+      st = fresh();
+      pdCache.at = 0;
+      return;
+    }
+    if (resetting) {
+      resetting = false;
+      sampler.setErrorGrace(RESET_ERROR_GRACE_MS);
+      logger.info('incident panel: reset finished');
+    }
+    if (chaos && chaos.scenario) sampler.setErrorGrace(0);
     if (chaos && !chaos.scenario) {
+      if (chaos.outcome === 'fixed') {
+        // A remediation cleared the scenario: that is a resolution, not a reset.
+        if (st.phase === 'incident') resolveNow(now, 'scenario cleared by a fix');
+        return;
+      }
       // No active scenario (fresh install, or reset just ran): clear everything.
       if (st.phase !== 'healthy' || st.lastTickAt) logger.info('incident panel: no active scenario, state cleared');
       st = fresh();
+      pdCache.at = 0;
       return;
     }
     if (st.phase === 'resolved') return; // frozen until reset
@@ -153,19 +229,9 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
     st.orderUnhealthyNow = Boolean(order && (!order.healthy || order.erroring));
 
     // PagerDuty: incidents on the TradeSim services since the scenario started. Failure falls back to health only.
-    let incidents = null;
-    if (pdEnabled) {
-      const since = (chaos && ts(chaos.since)) || bootAt;
-      try {
-        incidents = await fetchIncidents(since);
-        st.source = 'pagerduty';
-      } catch (err) {
-        st.source = 'health-summary';
-        logger.warn(`incident panel: PagerDuty unavailable, using health summary: ${err.message}`);
-      }
-    } else {
-      st.source = 'health-summary';
-    }
+    const since = (chaos && ts(chaos.since)) || bootAt;
+    const incidents = await pagerDutyIncidents(since, now);
+    st.source = incidents ? 'pagerduty' : 'health-summary';
     if (incidents) st.incidents = incidents;
     const open = incidents ? incidents.filter((i) => i.status !== 'resolved') : [];
 
@@ -184,36 +250,42 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
     st.lastTickAt = now;
     if (st.orderUnhealthyNow) st.orderUnhealthyMs += dt;
 
+    if (!st.restartAt) {
+      const restart = sampler.restartsSince(st.startedAt + RESTART_NOTE_AFTER_S * 1000).find((r) => !st.fixAt || r.at < st.fixAt);
+      if (restart) st.restartAt = restart.at;
+    }
+
     if (incidents && incidents.length) {
       st.detectedAt = Math.min(...incidents.map((i) => ts(i.created_at)));
       for (const i of open) {
         for (const a of i.assignments || []) if (a.assignee && a.assignee.type.startsWith('user')) st.engineers.add(a.assignee.id);
         for (const a of i.acknowledgements || []) if (a.acknowledger && a.acknowledger.type.startsWith('user')) st.engineers.add(a.acknowledger.id);
       }
-      if (tickNo % 2 === 0 && (!st.rootCause || !st.fixAt)) {
+      if (pdCache.at === now && (!st.rootCauseAt || !st.fixAt)) {
         try { await enrichFromPagerDuty(incidents); } catch (err) { logger.warn(`incident panel: PagerDuty detail lookup failed: ${err.message}`); }
       }
     }
 
-    const viaPd = st.source === 'pagerduty';
-    const healthyNow = degraded.length === 0 && open.length === 0 && (!viaPd || incidents.length > 0);
-    if (healthyNow) {
-      st.healthyTicks++;
-      if (!st.healthySince) st.healthySince = now;
-    } else {
-      st.healthyTicks = 0;
-      st.healthySince = null;
-    }
-    if (st.healthyTicks >= STABLE_TICKS[st.source] && (now - st.startedAt) / 1000 >= MIN_INCIDENT_S[st.source]) {
-      const pdResolvedAt = incidents && incidents.length ? Math.max(...incidents.map((i) => ts(i.last_status_change_at) || 0)) : 0;
-      st.resolvedAt = Math.max(st.healthySince, pdResolvedAt);
-      st.phase = 'resolved';
-      st.frozen = measure(st.resolvedAt);
-      logger.info(`incident panel: resolved after ${Math.round((st.resolvedAt - st.startedAt) / 1000)}s scenario=${st.scenario}`);
+    // Resolved: see the header comment. Health alone only counts when no scenario is known.
+    let quiet;
+    if (st.source === 'pagerduty') quiet = incidents.length > 0 && open.length === 0;
+    else if (!st.scenario) quiet = degraded.length === 0;
+    else quiet = false;
+    if (quiet) { if (!st.healthySince) st.healthySince = now; } else st.healthySince = null;
+    if (!quiet) return;
+    if (st.source === 'pagerduty') {
+      if (now - st.healthySince >= PD_STABLE_MS && (now - st.startedAt) / 1000 >= MIN_INCIDENT_S) {
+        const resolvedAt = Math.max(...incidents.map((i) => ts(i.last_status_change_at) || 0), st.healthySince);
+        resolveNow(Math.min(resolvedAt, now), 'PagerDuty incident resolved');
+      }
+    } else if (now - st.healthySince >= HEALTH_ONLY_RESOLVE_S * 1000) {
+      resolveNow(st.healthySince, `healthy for ${HEALTH_ONLY_RESOLVE_S}s`);
     }
   }
 
   // ---- outputs ----
+  const presetHeadlines = () => HEADLINES[st.scenario] || GENERIC_HEADLINES;
+
   function recordFailedOrder(value) {
     if (!(value > 0)) return;
     const now = Date.now();
@@ -221,13 +293,24 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
     st.failedOrders.push({ at: now, value });
   }
 
+  // An order that filled while the price feed was stale (S3). Counted only while a stale-price scenario is active.
+  function recordFill(value, priceAgeS) {
+    if (!(value > 0) || !(priceAgeS > STALE_FEED_S) || !STALE_SCENARIOS.has(st.scenario)) return;
+    const now = Date.now();
+    st.staleTrades = st.staleTrades.filter((o) => now - o.at < FAILED_ORDER_KEEP_MS);
+    st.staleTrades.push({ at: now, value });
+  }
+
   function measure(end) {
     const elapsedS = Math.max(0, (end - st.startedAt) / 1000);
     const failed = st.failedOrders.filter((o) => o.at >= st.startedAt && o.at <= end).reduce((sum, o) => sum + o.value, 0);
+    const stale = st.staleTrades.filter((o) => o.at <= end);
     const engineers = Math.max(config.defaultEngineers, st.engineers.size);
     return {
       elapsedS,
       revenueAtRisk: Math.round(failed + (st.orderUnhealthyMs / 1000) * config.revenuePerS),
+      staleTrades: stale.length,
+      staleExposure: Math.round(stale.reduce((sum, o) => sum + o.value, 0)),
       engineers,
       cost: Math.round(engineers * (elapsedS / 60) * config.hourlyRate),
     };
@@ -238,18 +321,19 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
     const resolved = st.phase === 'resolved';
     return [
       { key: 'detected', label: 'Detected', elapsedS: rel(st.detectedAt || st.startedAt), detail: null },
-      { key: 'root_cause', label: 'Root cause found', elapsedS: rel(st.rootCauseAt), detail: st.rootCause },
+      { key: 'root_cause', label: 'Root cause found', elapsedS: rel(st.rootCauseAt), detail: st.rootCause, url: st.rootCauseUrl },
       { key: 'fix', label: 'Fix approved', elapsedS: rel(st.fixAt), detail: null },
       { key: 'resolved', label: 'Resolved', elapsedS: resolved ? Math.round(m.elapsedS) : null, detail: null },
     ];
   }
 
+  // The left panel always shows the preset headlines, never live note text.
   function delivered() {
-    const [d, r, p] = HEADLINES[st.scenario] || GENERIC_HEADLINES;
+    const [d, r, p] = presetHeadlines();
     return {
       scenario: st.scenario,
       blocks: [
-        { key: 'detect', title: 'DETECT', headline: st.rootCause || d, value: DELIVERED_VALUES.detect },
+        { key: 'detect', title: 'DETECT', headline: d, value: DELIVERED_VALUES.detect },
         { key: 'resolve', title: 'RESOLVE', headline: r, value: DELIVERED_VALUES.resolve },
         { key: 'prevent', title: 'PREVENT', headline: p, value: DELIVERED_VALUES.prevent },
       ],
@@ -258,17 +342,23 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
 
   function snapshot() {
     const base = { phase: st.phase, source: st.source, serverNow: Date.now() };
+    if (resetting) return { ...base, phase: 'resetting' };
     if (st.phase === 'healthy') return base;
     const resolved = st.phase === 'resolved';
     const m = resolved ? st.frozen : measure(Date.now());
+    const kind = STALE_SCENARIOS.has(st.scenario) ? 'stale' : 'revenue';
     return {
       ...base,
       scenario: st.scenario,
       startedAt: st.startedAt,
       resolvedAt: st.resolvedAt,
-      metrics: { revenueAtRisk: m.revenueAtRisk, timeToResolveS: Math.round(m.elapsedS), engineers: m.engineers, cost: m.cost },
-      live: resolved ? null : { orderUnhealthy: st.orderUnhealthyNow, revenuePerS: config.revenuePerS, hourlyRate: config.hourlyRate },
+      metrics: {
+        kind, revenueAtRisk: m.revenueAtRisk, staleTrades: m.staleTrades, staleExposure: m.staleExposure,
+        timeToResolveS: Math.round(m.elapsedS), engineers: m.engineers, cost: m.cost,
+      },
+      live: resolved ? null : { orderUnhealthy: kind === 'revenue' && st.orderUnhealthyNow, revenuePerS: config.revenuePerS, hourlyRate: config.hourlyRate },
       timeline: timeline(m),
+      notes: st.restartAt ? [{ label: 'Pod restarted automatically, issue persists', elapsedS: Math.max(0, Math.round((st.restartAt - st.startedAt) / 1000)) }] : [],
       comparison: config.comparison,
       delivered: resolved ? delivered() : null,
     };
@@ -277,7 +367,7 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
   tick().catch((err) => logger.error(`incident panel tick failed: ${err.message}`));
   setInterval(() => tick().catch((err) => logger.error(`incident panel tick failed: ${err.stack || err.message}`)), TICK_MS).unref();
 
-  return { snapshot, recordFailedOrder, pdEnabled };
+  return { snapshot, recordFailedOrder, recordFill, pdEnabled, tick };
 }
 
 module.exports = { createIncidentPanel };

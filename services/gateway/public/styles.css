@@ -61,6 +61,7 @@ nav a.active { background: var(--surface-2); color: var(--text); }
 
 /* status banner */
 .banner { background: var(--warn-bg); color: var(--warn-text); text-align: center; padding: .6rem 1rem; font-weight: 600; border-bottom: 1px solid var(--border); }
+.banner.info { background: var(--surface-2); color: var(--muted); }
 .banner[hidden] { display: none; }
 
 /* layout */
@@ -100,6 +101,7 @@ select, input {
 select:focus, input:focus, button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .btn { font: inherit; font-weight: 600; border: 0; border-radius: 8px; padding: .65rem 1rem; cursor: pointer; background: var(--accent); color: var(--accent-text); }
 .btn:disabled { opacity: .6; cursor: wait; }
+.btn-small { padding: .3rem .7rem; margin-left: .5rem; font-size: .85rem; }
 .quote-line { background: var(--surface-2); border-radius: 8px; padding: .6rem .8rem; display: flex; justify-content: space-between; gap: 1rem; font-variant-numeric: tabular-nums; }
 
 /* messages */
@@ -138,6 +140,7 @@ select:focus, input:focus, button:focus-visible, a:focus-visible { outline: 2px 
 
 .pill { display: inline-flex; align-items: center; gap: .5rem; background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: .4rem .85rem; box-shadow: var(--shadow); color: var(--muted); font-weight: 600; }
 .pill .dot { background: var(--up); }
+.pill .dot.idle { background: #9aa6b5; }
 .panel-right.pill { width: auto; right: 1rem; }
 
 .ipanel { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 6px 24px rgba(16, 24, 40, .18); overflow: hidden; }
@@ -151,6 +154,7 @@ select:focus, input:focus, button:focus-visible, a:focus-visible { outline: 2px 
 .ip-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; padding: .75rem .9rem 0; }
 .ip-metric { background: var(--surface-2); border-radius: 10px; padding: .5rem .65rem; }
 .ip-metric .k { color: var(--muted); font-size: .68rem; text-transform: uppercase; letter-spacing: .04em; }
+.ip-metric .sub { color: var(--muted); font-size: .72rem; font-variant-numeric: tabular-nums; }
 .ip-metric .v { font-size: 1.2rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .ip-section { padding: .75rem .9rem 0; }
 .ip-section h3 { margin: 0 0 .4rem; font-size: .72rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
@@ -160,6 +164,10 @@ select:focus, input:focus, button:focus-visible, a:focus-visible { outline: 2px 
 .ip-steps .mark { font-weight: 700; color: var(--muted); }
 .ip-steps li.done .mark { color: var(--up); }
 .ip-steps .t { font-variant-numeric: tabular-nums; color: var(--muted); }
+.ip-steps li.note { color: var(--text); }
+.ip-steps li.note .mark { color: var(--muted); }
+.ip-link { grid-column: 2 / 4; font-size: .74rem; color: var(--accent); text-decoration: none; }
+.ip-link:hover { text-decoration: underline; }
 .ip-steps .d { grid-column: 2 / 4; font-size: .78rem; color: var(--muted); overflow-wrap: anywhere; }
 .ip-compare { padding: .75rem .9rem; color: var(--muted); font-size: .78rem; }
 .ip-checks { display: flex; justify-content: center; gap: 1rem; padding: .5rem .9rem; border-top: 1px solid var(--border); font-weight: 600; color: var(--up); }

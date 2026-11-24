@@ -24,13 +24,26 @@ need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
 kube() { echo "+ kubectl $*"; $K "$@"; }
 
 # Baseline image tag per service: gateway carries the UI build, everything else is v1.0.0.
-baseline_tag() { if [ "$1" = gateway ]; then echo v1.0.0-ui3; else echo v1.0.0; fi; }
+baseline_tag() { if [ "$1" = gateway ]; then echo v1.0.0-ui4; else echo v1.0.0; fi; }
+svc_port() {
+  case "$1" in
+    order) echo 8081 ;; risk) echo 8082 ;; account) echo 8083 ;; portfolio) echo 8084 ;; market-data) echo 8085 ;; gateway) echo 8080 ;;
+    *) return 1 ;;
+  esac
+}
+# Base URL of a TradeSim service: in-cluster DNS when IN_CLUSTER=1, otherwise the Service ClusterIP (reachable from the k3s host).
+svc_url() {
+  local host
+  if [ "${IN_CLUSTER:-0}" = 1 ]; then host="$1.$NS"; else host=$($K -n "$NS" get svc "$1" -o jsonpath='{.spec.clusterIP}' 2>/dev/null); fi
+  [ -n "$host" ] && echo "http://$host:$(svc_port "$1")"
+}
 image_ref() { echo "ghcr.io/$OWNER/tradesim-$1:$2"; }
 
 # ---- chaos-api (flags + active scenario) ----
 # CHAOS_URL wins; otherwise the Service ClusterIP (reachable from the k3s host). Empty output = not deployed.
 chaos_url() {
   if [ -n "${CHAOS_URL:-}" ]; then echo "$CHAOS_URL"; return; fi
+  if [ "${IN_CLUSTER:-0}" = 1 ]; then echo "http://chaos-api.platform:8090"; return; fi
   local ip
   ip=$($K -n platform get svc chaos-api -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
   if [ -n "$ip" ]; then echo "http://$ip:8090"; fi

@@ -3,7 +3,8 @@ const { Pool, Client } = require('pg');
 
 const POOL_EXHAUSTED_RE = /timeout exceeded when trying to connect/;
 const HOLD_BELOW_POOL_SIZE = 10;
-const CONNECT_RETRY_MS = 5000;
+const CONNECT_RETRY_WINDOW_MS = 5000;
+const CONNECT_RETRY_INTERVAL_MS = 1000;
 
 class PoolExhaustedError extends Error {
   constructor(inUse, max, waitedMs) {
@@ -55,11 +56,14 @@ function createDb(config, logger) {
     }
   }
 
-  // One retry after 5s, then throw. Each failure is logged as "cannot connect to DB_HOST=<host>" so the cause
-  // is the last thing `kubectl logs --previous` shows after the crash (scenario S5).
-  async function connectOrThrow(attempts = 2) {
+  // Retries for 5s, then throws. Nothing is logged per attempt: the caller logs one clear line
+  // "cannot connect to DB_HOST=<host>" before exiting, so it is the last line `kubectl logs --previous` shows (S5).
+  async function connectOrThrow() {
+    const deadline = Date.now() + CONNECT_RETRY_WINDOW_MS;
     let last;
-    for (let i = 1; i <= attempts; i++) {
+    let attempts = 0;
+    for (;;) {
+      attempts++;
       const client = new Client({ ...connOpts, connectionTimeoutMillis: 2000 });
       try {
         await client.connect();
@@ -69,12 +73,11 @@ function createDb(config, logger) {
       } catch (err) {
         last = err;
         client.end().catch(() => {});
-        const more = i < attempts;
-        logger.error(`cannot connect to DB_HOST=${host}: ${err.message}${more ? ` (attempt ${i}/${attempts}, retrying in ${CONNECT_RETRY_MS / 1000}s)` : ` (attempt ${i}/${attempts}, giving up)`}`);
-        if (more) await new Promise((r) => setTimeout(r, CONNECT_RETRY_MS));
       }
+      if (Date.now() >= deadline) break;
+      await new Promise((r) => setTimeout(r, CONNECT_RETRY_INTERVAL_MS));
     }
-    throw new Error(`cannot connect to DB_HOST=${host}: ${last.message}`);
+    throw new Error(`cannot connect to DB_HOST=${host} after ${attempts} attempts over ${CONNECT_RETRY_WINDOW_MS / 1000}s (${last.message})`);
   }
 
   // Runs one query on a pooled connection. When the pool is tiny, each query holds its connection for holdMs
