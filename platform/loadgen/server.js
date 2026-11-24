@@ -1,0 +1,101 @@
+'use strict';
+// Synthetic customers: each one, every LOADGEN_INTERVAL_MS, gets quotes, portfolio and account (what the
+// dashboard polls) and places a small order, all through the gateway. Never stops. This traffic is what makes
+// error rates, pool saturation (S2) and the memory leak (S4) real.
+const express = require('express');
+const { createLogger } = require('../../shared/logger');
+const { createMetrics } = require('../../shared/metrics');
+const { mountStandardRoutes } = require('../../shared/health');
+const { SYMBOLS } = require('../../shared/tickers');
+
+const SERVICE = 'loadgen';
+const VERSION = process.env.VERSION || 'dev';
+const PORT = parseInt(process.env.PORT || '8090', 10);
+const GATEWAY_URL = process.env.GATEWAY_URL || 'http://gateway.tradesim:8080';
+const CUSTOMERS = (process.env.LOADGEN_CUSTOMERS || 'c-2001,c-2002,c-2003,c-2004,c-2005').split(',').map((s) => s.trim()).filter(Boolean);
+const INTERVAL_MS = parseInt(process.env.LOADGEN_INTERVAL_MS || '2000', 10);
+const MAX_QTY = parseInt(process.env.LOADGEN_MAX_QTY || '3', 10);
+const MAX_INFLIGHT = 3; // per customer; a hung backend must not pile up unbounded cycles
+const REPORT_MS = 10000;
+const SUMMARY_MS = 30000;
+
+const logger = createLogger({ service: SERVICE, version: VERSION });
+const totals = { calls: 0, failed: 0, cycles: 0 };
+const metrics = createMetrics({ service: SERVICE, version: VERSION, extra: () => ({ ...totals, customers: CUSTOMERS.length }) });
+
+// Failures are aggregated per call+status so an outage logs a few clean lines, not one per request.
+let failures = new Map();
+
+async function step(name, customerId, method, path, body) {
+  const start = Date.now();
+  totals.calls++;
+  let status = 0;
+  let sample = null;
+  try {
+    const res = await fetch(`${GATEWAY_URL}${path}`, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: body && JSON.stringify(body),
+      signal: AbortSignal.timeout(5000),
+    });
+    status = res.status;
+    const text = await res.text();
+    if (status >= 400) sample = (() => { try { return JSON.parse(text); } catch { return { error: text.slice(0, 120) }; } })();
+  } catch (err) {
+    sample = { error: err.name === 'TimeoutError' ? 'timed out after 5000ms' : `${err.message}${err.cause && err.cause.code ? ` (${err.cause.code})` : ''}` };
+  }
+  metrics.record(`${method} ${name}`, status || 599, Date.now() - start);
+  if (status >= 200 && status < 400) return true;
+  totals.failed++;
+  const key = `${name} ${status || 'no-response'}`;
+  const f = failures.get(key) || { count: 0, customerId, sample };
+  f.count++;
+  failures.set(key, f);
+  return false;
+}
+
+async function cycle(customerId) {
+  const id = encodeURIComponent(customerId);
+  await step('quotes', customerId, 'GET', '/api/quotes');
+  await step('portfolio', customerId, 'GET', `/api/portfolio/${id}`);
+  await step('account', customerId, 'GET', `/api/accounts/${id}`);
+  const symbol = SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)];
+  const qty = 1 + Math.floor(Math.random() * MAX_QTY);
+  await step('order', customerId, 'POST', '/api/orders', { customerId, symbol, qty });
+  totals.cycles++;
+}
+
+CUSTOMERS.forEach((customerId, i) => {
+  let inflight = 0;
+  // Stagger customers across the interval so load is steady rather than bursty.
+  setTimeout(() => {
+    setInterval(() => {
+      if (inflight >= MAX_INFLIGHT) return;
+      inflight++;
+      cycle(customerId).catch((err) => logger.error(`cycle crashed customer=${customerId}: ${err.message}`)).finally(() => { inflight--; });
+    }, INTERVAL_MS).unref();
+  }, Math.round((i * INTERVAL_MS) / CUSTOMERS.length));
+});
+
+setInterval(() => {
+  for (const [key, f] of failures) {
+    logger.warn(`loadgen ${key}: ${f.count} failures in last ${REPORT_MS / 1000}s, e.g. customer=${f.customerId} ${JSON.stringify(f.sample)}`, { traceId: f.sample && f.sample.traceId });
+  }
+  failures = new Map();
+}, REPORT_MS).unref();
+
+setInterval(() => {
+  const m = metrics.snapshot();
+  logger.info(`loadgen summary (60s): requests=${m.requests} errors=${m.errors} error_rate=${m.error_rate} p95_ms=${m.p95_ms} customers=${CUSTOMERS.length} gateway=${GATEWAY_URL}`);
+}, SUMMARY_MS).unref();
+
+const app = express();
+mountStandardRoutes(app, { service: SERVICE, version: VERSION, logger, metrics });
+const server = app.listen(PORT, () => logger.info(`loadgen started: ${CUSTOMERS.length} customers every ${INTERVAL_MS}ms against ${GATEWAY_URL}`));
+const shutdown = () => {
+  logger.info('shutting down');
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 1000).unref();
+};
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);

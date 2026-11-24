@@ -1,0 +1,37 @@
+# Minimal chaos-api (P4): flags + scenario state. P6 adds the /ops console, RBAC and scripts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chaos-api
+  namespace: platform
+  labels: {app: chaos-api}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: chaos-api}
+  template:
+    metadata:
+      labels: {app: chaos-api}
+    spec:
+      containers:
+        - name: chaos-api
+          image: ghcr.io/pdt-faisaldemo/tradesim-chaos-api:v1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8090
+          readinessProbe:
+            tcpSocket: {port: 8090}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chaos-api
+  namespace: platform
+spec:
+  selector: {app: chaos-api}
+  ports:
+    - {port: 8090, targetPort: 8090}

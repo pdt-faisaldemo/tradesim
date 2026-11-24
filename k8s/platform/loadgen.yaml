@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: platform
+  labels: {app: loadgen}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: loadgen}
+  template:
+    metadata:
+      labels: {app: loadgen}
+    spec:
+      containers:
+        - name: loadgen
+          image: ghcr.io/pdt-faisaldemo/tradesim-loadgen:v1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8090
+          env:
+            - {name: GATEWAY_URL, value: "http://gateway.tradesim:8080"}
+            - {name: LOADGEN_CUSTOMERS, value: "c-2001,c-2002,c-2003,c-2004,c-2005"}
+            - {name: LOADGEN_INTERVAL_MS, value: "2000"}
+          readinessProbe:
+            tcpSocket: {port: 8090}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 50m, memory: 48Mi}
+            limits: {memory: 128Mi}

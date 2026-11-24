@@ -32,13 +32,18 @@ data:
       avg_cost    numeric(14,4) NOT NULL,
       PRIMARY KEY (customer_id, symbol)
     );
-    -- Reset state: no order history, a small starting portfolio.
+    -- Synthetic customers for loadgen. Separate from c-1001 so background traffic never drains the demo
+    -- customer's cash; their balance is large enough to run for days.
+    INSERT INTO accounts (id, name, cash) VALUES
+      ('c-2001', 'Load Customer 1', 1000000000.00),
+      ('c-2002', 'Load Customer 2', 1000000000.00),
+      ('c-2003', 'Load Customer 3', 1000000000.00),
+      ('c-2004', 'Load Customer 4', 1000000000.00),
+      ('c-2005', 'Load Customer 5', 1000000000.00)
+    ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, cash = EXCLUDED.cash, updated_at = now();
+    -- Reset state: no order history and no positions.
     TRUNCATE orders;
     DELETE FROM positions;
-    INSERT INTO positions (customer_id, symbol, qty, avg_cost) VALUES
-      ('c-1001', 'AMZN', 40, 208.15),
-      ('c-1001', 'IBM', 25, 255.00),
-      ('c-1001', 'CRWD', 10, 455.00);
 ---
 apiVersion: batch/v1
 kind: Job

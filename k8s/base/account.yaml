@@ -6,6 +6,11 @@ metadata:
   labels: {app: account}
 spec:
   replicas: 1
+  # Recreate on purpose: with a rolling update, scenario S5 (bad DB_HOST) would leave the old pod serving
+  # and hide the outage. `rollingUpdate: null` lets kubectl apply switch an existing Deployment over.
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   selector:
     matchLabels: {app: account}
   template:

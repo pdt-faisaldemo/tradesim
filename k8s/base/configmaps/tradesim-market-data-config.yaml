@@ -8,3 +8,4 @@ data:
   REDIS_HOST: "redis"
   REDIS_PORT: "6379"
   TICK_INTERVAL_MS: "2000"
+  CHAOS_API_URL: "http://chaos-api.platform:8090"

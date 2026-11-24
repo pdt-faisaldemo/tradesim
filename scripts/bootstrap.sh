@@ -42,6 +42,12 @@ for svc in $SERVICES; do
   $K -n tradesim rollout status deploy/$svc --timeout=120s
 done
 
+echo "==> platform (chaos-api flags, loadgen)"
+$K apply -f k8s/platform/
+for d in chaos-api loadgen; do
+  $K -n platform rollout status deploy/$d --timeout=120s
+done
+
 echo "==> ingress"
 $K apply -f k8s/base/ingress.yaml
 echo "bootstrap done"

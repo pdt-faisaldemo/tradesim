@@ -14,6 +14,8 @@ const REDIS_HOST = process.env.REDIS_HOST || 'redis';
 const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379', 10);
 const TICK_INTERVAL_MS = parseInt(process.env.TICK_INTERVAL_MS || '2000', 10);
 const STALE_AFTER_S = parseInt(process.env.FEED_STALE_AFTER_S || '30', 10);
+const CHAOS_API_URL = process.env.CHAOS_API_URL || 'http://chaos-api.platform:8090';
+const FLAG_POLL_MS = parseInt(process.env.FLAG_POLL_MS || '5000', 10);
 const PRICES_KEY = 'tradesim:prices';
 const VOLATILITY = 0.0015; // per-tick standard deviation of the random walk
 
@@ -80,9 +82,33 @@ async function tick() {
   lastTickAt = Date.now();
 }
 
+// ---- demo flag feedPaused (scenario S3): polled from chaos-api; false when chaos-api is absent ----
+let feedPaused = false;
+let flagsReachable = null;
+
+async function pollFlags() {
+  let paused = false;
+  try {
+    const r = await fetch(`${CHAOS_API_URL}/flags`, { signal: AbortSignal.timeout(1000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    paused = (await r.json()).feedPaused === true;
+    if (flagsReachable === false) logger.info(`flags reachable again at CHAOS_API_URL=${CHAOS_API_URL}`);
+    flagsReachable = true;
+  } catch (err) {
+    if (flagsReachable !== false) logger.info(`flags unavailable at CHAOS_API_URL=${CHAOS_API_URL} (${err.message}); using feedPaused=false`);
+    flagsReachable = false;
+  }
+  if (paused !== feedPaused) {
+    feedPaused = paused;
+    logger.info(feedPaused ? 'flag feedPaused=true: price ticks stopped' : 'flag feedPaused=false: price ticks resumed');
+  }
+}
+pollFlags();
+setInterval(pollFlags, FLAG_POLL_MS).unref();
+
 let ticking = false;
 async function safeTick() {
-  if (ticking) return;
+  if (ticking || feedPaused) return;
   ticking = true;
   try {
     await tick();
