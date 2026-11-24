@@ -10,3 +10,9 @@ data:
   ACCOUNT_URL: "http://account:8083"
   PORTFOLIO_URL: "http://portfolio:8084"
   MARKET_DATA_URL: "http://market-data:8085"
+  # Incident panel (UI): chaos-api for the active scenario, and the illustrative numbers.
+  CHAOS_URL: "http://chaos-api.platform:8090"
+  REVENUE_AT_RISK_PER_S: "500"
+  ENGINEER_HOURLY_RATE: "150"
+  DEFAULT_ENGINEERS: "1"
+  TYPICAL_COMPARISON: "6 engineers · 45+ min · $680"

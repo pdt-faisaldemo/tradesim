@@ -29,14 +29,14 @@ Through the gateway (`http://<EC2_IP>/`): `/api/health-summary`, `/api/quotes`, 
 `/api/portfolio/c-1001`, `/api/orders`, `POST /api/orders {"symbol":"NVDA","qty":50}`.
 
 ## P4: fault scenarios, scripts, loadgen
-Baseline images: `gateway` `v1.0.0-ui1`, every other service `v1.0.0` (also `loadgen` and `chaos-api` `v1.0.0`).
+Baseline images: `gateway` `v1.0.0-ui3`, every other service `v1.0.0` (also `loadgen` and `chaos-api` `v1.0.0`).
 Fault images: `risk:v1.0.1` from `demo/bad-risk-check` (S1) and `portfolio:v1.0.1` from `demo/portfolio-leak` (S4).
 
 Build each with Actions -> `build-image` (inputs `service`, `git_ref`, `tag`):
 
 | service | git_ref | tag |
 |---|---|---|
-| gateway | main | v1.0.0-ui1 |
+| gateway | main | v1.0.0-ui3 |
 | account, market-data, risk, order, portfolio | main | v1.0.0 |
 | loadgen, chaos-api | main | v1.0.0 |
 | risk | demo/bad-risk-check | v1.0.1 |
@@ -56,4 +56,18 @@ nano ~/.tradesim.env        # start from scripts/tradesim.env.example; set KUBEC
 scripts/scenario.sh <S1|S2|S3|S4|S5|COMBO> [quick|deep]   # refuses if one is already active (FORCE=1 overrides)
 scripts/reset.sh                                          # prints ALL HEALTHY
 ```
-S2 sends the decoy change event on portfolio, waits `S2_DECOY_DELAY_S` (default 60), then sets account `DB_MAX_POOL=3`.
+S2 sends the decoy change event on portfolio, waits `S2_DECOY_DELAY_S` (default 60), then sets account `DB_MAX_POOL=2` and `DB_POOL_TIMEOUT_MS=500` (account answers 503 `db pool exhausted: 2/2 in use, waited 500ms`; reset restores 50 / 2000).
+
+### Incident panel (gateway UI)
+Right panel (incident status) and left panel (Reliability delivered) are fed by `GET /api/incident-panel`. The gateway
+polls chaos-api `/state` and, when `PD_API_TOKEN` and `PD_SERVICE_IDS` are in `tradesim-secrets`, the PagerDuty REST API
+every 5s; otherwise (or if the API fails) it uses health and error-rate signals only. It only evaluates while a scenario is
+active; reset clears the scenario and restarts the gateway, which clears the panel. Tunables live in
+`k8s/base/configmaps/tradesim-gateway-config.yaml`: `REVENUE_AT_RISK_PER_S` (500), `ENGINEER_HOURLY_RATE` (150),
+`DEFAULT_ENGINEERS` (1), `TYPICAL_COMPARISON`.
+Enable PagerDuty data on EC2:
+```
+sudo k3s kubectl -n tradesim patch secret tradesim-secrets --type merge \
+  -p "{\"stringData\":{\"PD_API_TOKEN\":\"...\",\"PD_SERVICE_IDS\":\"PXXXX,PYYYY\"}}"
+sudo k3s kubectl -n tradesim rollout restart deploy/gateway
+```
