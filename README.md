@@ -29,14 +29,14 @@ Through the gateway (`http://<EC2_IP>/`): `/api/health-summary`, `/api/quotes`, 
 `/api/portfolio/c-1001`, `/api/orders`, `POST /api/orders {"symbol":"NVDA","qty":50}`.
 
 ## P4: fault scenarios, scripts, loadgen
-Baseline images: `gateway` `v1.0.0-ui5`, every other service `v1.0.0` (also `loadgen` and `chaos-api` `v1.0.0`).
+Baseline images: `gateway` `v1.0.0-ui6`, every other service `v1.0.0` (also `loadgen` and `chaos-api` `v1.0.0`).
 Fault images: `risk:v1.0.1` from `demo/bad-risk-check` (S1) and `portfolio:v1.0.1` from `demo/portfolio-leak` (S4).
 
 Build each with Actions -> `build-image` (inputs `service`, `git_ref`, `tag`):
 
 | service | git_ref | tag |
 |---|---|---|
-| gateway | main | v1.0.0-ui5 |
+| gateway | main | v1.0.0-ui6 |
 | account, market-data, risk, order, portfolio | main | v1.0.0 |
 | loadgen, chaos-api | main | v1.0.0 |
 | risk | demo/bad-risk-check | v1.0.1 |

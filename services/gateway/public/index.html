@@ -26,12 +26,18 @@
 
   <div id="banner" class="banner" role="status" hidden>Trading is degraded. We're working on it.</div>
 
-  <main id="app" aria-live="polite"></main>
-
-  <!-- Floating panels (Dashboard, Trade and Portfolio only). Left: Reliability delivered. Right: incident status. -->
-  <div id="dock" class="dock" hidden>
-    <aside id="delivered-panel" class="panel panel-left" aria-label="Reliability delivered" hidden></aside>
-    <aside id="incident-panel" class="panel panel-right" aria-label="Incident status"></aside>
+  <!-- Three columns: left rail (Reliability delivered), content, right rail (incident status). The rails reserve their
+       width, so the panels never cover page content. Below 1100px the panels collapse to edge tabs; below 900px to bottom tabs. -->
+  <div id="layout" class="layout">
+    <div id="rail-left" class="rail rail-left" hidden>
+      <button id="tab-left" class="rail-tab" type="button" aria-expanded="false" hidden>&#10003; Reliability</button>
+      <aside id="delivered-panel" class="panel panel-left" aria-label="Reliability delivered" hidden></aside>
+    </div>
+    <main id="app" aria-live="polite"></main>
+    <div id="rail-right" class="rail rail-right" hidden>
+      <button id="tab-right" class="rail-tab" type="button" aria-expanded="false" hidden></button>
+      <aside id="incident-panel" class="panel panel-right" aria-label="Incident status"></aside>
+    </div>
   </div>
 
   <footer class="footer">

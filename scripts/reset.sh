@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Usage: reset.sh
 # Back to baseline: flags off (feedPaused=false, loadgen 5 customers), story cleared (both UI panels disappear), every Deployment on its baseline
-# image (gateway v1.0.0-ui5, the rest v1.0.0) with baseline ConfigMaps (account DB_MAX_POOL=50, DB_POOL_TIMEOUT_MS=2000)
+# image (gateway v1.0.0-ui6, the rest v1.0.0) with baseline ConfigMaps (account DB_MAX_POOL=50, DB_POOL_TIMEOUT_MS=2000)
 # and no env overrides, database reseeded (c-1001 cash 41870.00 with 10 positions and 10 orders), open incidents on the
 # TradeSim services resolved. Prints ALL HEALTHY when every /health is 200.
 #

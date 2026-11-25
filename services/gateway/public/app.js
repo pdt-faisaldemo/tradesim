@@ -339,7 +339,8 @@ function route() {
   const root = clear(document.getElementById('app'));
   document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.page === name));
   document.title = `TradeSim – ${name[0].toUpperCase()}${name.slice(1)}`;
-  document.getElementById('dock').hidden = !PANEL_PAGES.has(name);
+  panelsOnPage = PANEL_PAGES.has(name);
+  applyRails();
   PAGES[name](root);
 }
 
@@ -425,12 +426,86 @@ let live = null; // text nodes updated every second while an incident is open
 let deliveredShown = false;
 let deliveredTimers = [];
 
+// ---------- collapsible panels ----------
+// Each panel collapses to a slim tab on its edge (a bottom tab below 900px). The choice is remembered per panel, separately
+// for wide (>=1100px) and narrow screens: wide defaults to expanded, narrow to collapsed (the panel then opens as an overlay).
+// Collapsing never removes a panel; only a clear path (or a new scenario) does.
+const RAILS = {
+  left: { rail: document.getElementById('rail-left'), tab: document.getElementById('tab-left'), label: 'Reliability delivered' },
+  right: { rail: document.getElementById('rail-right'), tab: document.getElementById('tab-right'), label: 'Incident status' },
+};
+const narrowMq = matchMedia('(max-width: 1099px)');
+const sheetMq = matchMedia('(max-width: 899px)');
+let panelsOnPage = true;
+const storeKey = (side) => `tradesim.panel.${side}.${narrowMq.matches ? 'narrow' : 'wide'}`;
+function isCollapsed(side) {
+  let saved = null;
+  try { saved = localStorage.getItem(storeKey(side)); } catch { /* storage unavailable */ }
+  return saved ? saved === 'collapsed' : narrowMq.matches;
+}
+function setCollapsed(side, collapsed) {
+  const save = (sd, c) => { try { localStorage.setItem(storeKey(sd), c ? 'collapsed' : 'expanded'); } catch { /* storage unavailable */ } };
+  save(side, collapsed);
+  // Two bottom sheets would sit on top of each other: opening one closes the other.
+  if (!collapsed && sheetMq.matches) save(side === 'left' ? 'right' : 'left', true);
+  applyRails();
+}
+const chevron = (side) => h('button', {
+  class: 'chev', type: 'button', onclick: () => setCollapsed(side, true),
+  'aria-label': `Collapse ${RAILS[side].label.toLowerCase()} panel`, title: 'Collapse',
+}, side === 'left' ? '\u2039' : '\u203a');
+
+// The right panel is a small pill while idle or resetting; the left one exists from resolved on.
+function railState() {
+  const phase = panelData && panelData.phase;
+  const right = !phase || phase === 'idle' || phase === 'resetting' ? 'idle' : 'story';
+  return { right, leftShown: !deliveredEl.hidden };
+}
+
+function applyRails() {
+  const { right, leftShown } = railState();
+  const shown = { left: panelsOnPage && leftShown, right: panelsOnPage };
+  for (const side of ['left', 'right']) {
+    const { rail, tab } = RAILS[side];
+    const idle = side === 'right' && right === 'idle';
+    const collapsed = shown[side] && !idle && isCollapsed(side);
+    rail.hidden = !panelsOnPage;
+    rail.classList.toggle('has-panel', shown[side]);
+    rail.classList.toggle('idle', idle);
+    rail.classList.toggle('collapsed', collapsed);
+    tab.hidden = !collapsed;
+    tab.setAttribute('aria-expanded', String(!collapsed));
+  }
+  document.body.classList.toggle('has-tabs', shown.left || (shown.right && right !== 'idle'));
+  updateTabs();
+}
+
+// Tab text: "● Incident mm:ss" (incident, fixing), "✓ Resolved mm:ss" (resolved), "✓ Reliability".
+function updateTabs() {
+  const d = panelData;
+  const tabL = RAILS.left.tab;
+  const tabR = RAILS.right.tab;
+  tabL.textContent = '\u2713 Reliability';
+  if (!d || !d.metrics) return;
+  const resolved = d.phase === 'resolved';
+  const elapsed = resolved ? d.metrics.timeToResolveS : d.detectedAt ? Math.max(0, (Date.now() + panelClockSkew - d.detectedAt) / 1000) : 0;
+  tabR.className = `rail-tab ${resolved ? 'resolved' : 'incident'}`;
+  tabR.textContent = `${resolved ? '\u2713 Resolved' : '\u25cf Incident'} ${mmss(elapsed)}`;
+}
+
+for (const side of ['left', 'right']) RAILS[side].tab.addEventListener('click', () => setCollapsed(side, false));
+narrowMq.addEventListener('change', applyRails);
+sheetMq.addEventListener('change', applyRails);
+new ResizeObserver(() => document.documentElement.style.setProperty('--footer-h', `${document.querySelector('.footer').offsetHeight}px`))
+  .observe(document.querySelector('.footer'));
+
 const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 const usd0 = (n) => usd.format(Math.round(n)).replace(/\.00$/, '');
 
 function paintIncidentPanel() {
   const d = panelData;
   live = null;
+  applyRails();
   clear(incidentEl);
   incidentEl.className = 'panel panel-right';
   if (d && d.phase === 'resetting') {
@@ -467,7 +542,7 @@ function paintIncidentPanel() {
     h('span', { class: 'mark', 'aria-hidden': 'true' }, '↻'), h('span', {}, n.label), h('span', { class: 't' }, mmss(n.elapsedS))));
 
   incidentEl.append(h('div', { class: `ipanel ${resolved ? 'resolved' : 'incident'} ${d.phase}`, role: 'status' },
-    h('div', { class: 'ip-head' }, h('span', {}, 'TradeSim incident'), h('span', { class: 'ip-chip' }, chip)),
+    h('div', { class: 'ip-head' }, h('span', {}, 'TradeSim incident'), h('span', { class: 'ip-head-end' }, h('span', { class: 'ip-chip' }, chip), chevron('right'))),
     h('div', { class: 'ip-metrics' },
       metric(stale ? 'Trades at stale prices' : 'Revenue at risk', first), metric('Time to resolve', time),
       metric('Engineers engaged', engineers), metric('Cost of response', cost)),
@@ -483,6 +558,7 @@ function paintIncidentPanel() {
 // Extrapolates between polls: elapsed time, cost, and revenue while the order service is unhealthy.
 function tickIncidentPanel() {
   const d = panelData;
+  updateTabs();
   if (!live || !d || (d.phase !== 'incident' && d.phase !== 'fixing') || !d.detectedAt) return;
   const nowServer = Date.now() + panelClockSkew;
   const sinceSnapshotS = Math.max(0, (nowServer - d.serverNow) / 1000);
@@ -501,6 +577,7 @@ function paintDeliveredPanel() {
     deliveredShown = false;
     deliveredEl.hidden = true;
     clear(deliveredEl);
+    applyRails();
     return;
   }
   if (deliveredShown) return; // stays as it is until reset
@@ -511,9 +588,10 @@ function paintDeliveredPanel() {
     h('span', { class: 'dp-headline' }, b.headline),
     h('span', { class: 'dp-value' }, b.value)));
   clear(deliveredEl).append(h('div', { class: 'dpanel' },
-    h('div', { class: 'dp-title' }, 'Reliability delivered'), blocks,
+    h('div', { class: 'dp-title' }, h('span', {}, 'Reliability delivered'), chevron('left')), blocks,
     h('div', { class: 'dp-foot' }, 'PagerDuty Reliability Platform')));
   deliveredEl.hidden = false;
+  applyRails();
   blocks.forEach((el, i) => deliveredTimers.push(setTimeout(() => el.classList.add('in'), 50 + i * BLOCK_STAGGER_MS)));
 }
 
