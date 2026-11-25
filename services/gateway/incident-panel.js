@@ -1,26 +1,18 @@
 'use strict';
-// Incident panel state for the UI: one in-memory state machine (healthy -> incident -> resolved), refreshed every 5s,
-// plus a 'resetting' phase while scripts/reset.sh runs. The status banner and the health dots follow this same state.
-//
-// Inputs: chaos-api /state (active scenario, resetting flag, outcome), the health sampler (health failing or error
-// rate over threshold), and the PagerDuty REST API (incidents, notes, log entries, change events) when PD_API_TOKEN
-// and PD_SERVICE_IDS are set.
-//
-// Resolving: while a scenario is active, health alone never resolves an incident. It ends when the PagerDuty incident
-// is resolved (needs the API token), or when the scenario is cleared: by a fix (chaos-api outcome 'fixed', set by
-// scripts/clear-scenario.sh from the Rundeck fix jobs) which shows Resolved, or by reset.sh which returns to healthy.
-// Only when no scenario is known (chaos-api unreachable) does health alone resolve, after 60 healthy seconds.
+// Incident panel for the UI. The story itself (idle -> incident -> fixing -> resolved) lives in chaos-api, so it survives
+// page reloads and gateway restarts and looks the same in every browser. This module reads it from chaos-api /state,
+// merges in the live metrics, and reports the two things only the gateway can see (it owns the health signals):
+//   detected: the first unhealthy signal (health, error rate, restarts, or a PagerDuty incident) while in incident
+//   resolved: while fixing, all services healthy for RESOLVE_HEALTHY_S in a row, or the PagerDuty incident resolved
+// Health never moves the phase backwards, and a partial fix (S4 restart, the leak returns) never resolves.
+// A 'resetting' phase is shown while scripts/reset.sh runs.
 
 const TICK_MS = 2000; // state machine; PagerDuty is polled every PD_POLL_MS
 const PD_POLL_MS = 5000;
 const CHAOS_TIMEOUT_MS = 1500;
 const PD_TIMEOUT_MS = 4000;
 const PD_BASE = 'https://api.pagerduty.com';
-// With PagerDuty, an incident must exist, none may be open for PD_STABLE_MS, and the incident must be at
-// least MIN_INCIDENT_S old: guards against a short-lived incident from the first blip (a rollout) resolving the panel.
-const PD_STABLE_MS = 10000;
-const MIN_INCIDENT_S = 30;
-const HEALTH_ONLY_RESOLVE_S = 60; // consecutive healthy seconds, only when no scenario is known
+const RESOLVE_HEALTHY_S = 15; // consecutive healthy seconds after the fix
 const RESET_ERROR_GRACE_MS = 35000; // error rates in the 30s window still describe the old fault right after a reset
 // A restart this long after the incident began, before any fix, is the platform restarting a crashing pod.
 const RESTART_NOTE_AFTER_S = 30;
@@ -29,10 +21,6 @@ const FAILED_ORDER_KEEP_MS = 30 * 60 * 1000;
 
 const ROOT_CAUSE_NOTE = /^\s*SRE Agent:\s*/i;
 const PANEL_SUMMARY_LINE = /^\s*Panel summary:\s*/i;
-const FIX_CHANGE_EVENT = /\bfix|rollback|rolled back|\[INC\]/i;
-// A Rundeck / automation job run on the incident. Diagnose runs automatically and is not the approved fix.
-const AUTOMATION_ENTRY = /rundeck|runbook|process automation|automation action|action_invocation|invoke_action/i;
-const DIAGNOSE = /diagnos/i;
 
 const DELIVERED_VALUES = {
   detect: 'Easy: one incident from many signals, no war room needed',
@@ -76,27 +64,30 @@ const STALE_SCENARIOS = new Set(['S3', 'COMBO']);
 
 function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, pd, config, logger }) {
   // pd: { token, serviceIds[] }; config: { revenuePerS, hourlyRate, defaultEngineers, comparison }
-  const bootAt = Date.now();
   const pdEnabled = Boolean(pd.token && pd.serviceIds.length);
-  let st = fresh();
+  let story = { phase: 'idle' }; // last story read from chaos-api
+  let st = fresh(null);
   let resetting = false;
 
-  function fresh() {
+  // Live measurements for the current story. Dropped when a new story starts or the story goes back to idle.
+  function fresh(storyId) {
     return {
-      phase: 'healthy', startedAt: null, resolvedAt: null, scenario: null, mode: null, source: pdEnabled ? 'pagerduty' : 'health-summary',
-      lastTickAt: null, healthyTicks: 0, healthySince: null, orderUnhealthyMs: 0, orderUnhealthyNow: false,
-      engineers: new Set(), failedOrders: [], staleTrades: [], incidents: [], detectedAt: null,
-      rootCause: null, rootCauseAt: null, rootCauseUrl: null, fixAt: null, restartAt: null,
-      frozen: null,
+      storyId, scenario: null, source: pdEnabled ? 'pagerduty' : 'health-summary', lastTickAt: null, healthySince: null,
+      orderUnhealthyMs: 0, orderUnhealthyNow: false, engineers: new Set(), failedOrders: [], staleTrades: [], incidents: [],
+      rootCause: null, rootCauseUrl: null,
     };
   }
 
   // ---- inputs ----
-  async function fetchChaos() {
+  async function chaosCall(path, body) {
     try {
-      const r = await fetch(`${chaosUrl}/state`, { signal: AbortSignal.timeout(CHAOS_TIMEOUT_MS) });
-      if (!r.ok) return null;
-      return await r.json();
+      const r = await fetch(`${chaosUrl}${path}`, {
+        method: body ? 'POST' : 'GET',
+        headers: body ? { 'content-type': 'application/json' } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(CHAOS_TIMEOUT_MS),
+      });
+      return r.ok ? await r.json() : null;
     } catch {
       return null;
     }
@@ -124,39 +115,34 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
     return body.incidents || [];
   }
 
-  // Notes and log entries are only looked up while something is still missing, and every other tick.
-  async function enrichFromPagerDuty(incidents) {
+  // The root-cause note is only looked up while fixing and until one is found.
+  async function findRootCauseNote(incidents) {
     for (const inc of incidents.slice(0, 5)) {
-      if (!st.rootCauseAt) {
-        const { notes = [] } = await pdGet(`/incidents/${inc.id}/notes`);
-        const note = notes.filter((n) => ROOT_CAUSE_NOTE.test(n.content || '')).sort((a, b) => ts(a.created_at) - ts(b.created_at))[0];
-        if (note) {
-          // The step shows the note's "Panel summary:" line; a note without one falls back to the scenario's preset text.
-          st.rootCause = panelSummary(note.content) || presetHeadlines()[0];
-          st.rootCauseAt = ts(note.created_at);
-          st.rootCauseUrl = safeUrl(inc.html_url);
-        }
-      }
-      if (!st.fixAt) {
-        const { log_entries: entries = [] } = await pdGet(`/incidents/${inc.id}/log_entries`, { is_overview: 'false', limit: 100 });
-        for (const e of entries) {
-          const text = `${e.type || ''} ${e.summary || ''} ${(e.channel && (e.channel.summary || e.channel.type)) || ''}`;
-          if (AUTOMATION_ENTRY.test(text) && !DIAGNOSE.test(text)) {
-            const at = ts(e.created_at);
-            if (!st.fixAt || at < st.fixAt) st.fixAt = at;
-          }
-        }
+      const { notes = [] } = await pdGet(`/incidents/${inc.id}/notes`);
+      const note = notes.filter((n) => ROOT_CAUSE_NOTE.test(n.content || '')).sort((a, b) => ts(a.created_at) - ts(b.created_at))[0];
+      if (note) {
+        // The step shows the note's "Panel summary:" line; a note without one falls back to the scenario's preset text.
+        st.rootCause = panelSummary(note.content) || presetHeadlines()[0];
+        st.rootCauseUrl = safeUrl(inc.html_url);
+        return;
       }
     }
-    if (!st.fixAt && st.startedAt) {
-      const { change_events: events = [] } = await pdGet('/change_events', { since: new Date(st.startedAt).toISOString(), limit: 100 });
-      for (const ev of events) {
-        const at = ts(ev.timestamp || ev.created_at);
-        if (at && at >= st.startedAt && /tradesim/i.test(ev.summary || '') && FIX_CHANGE_EVENT.test(ev.summary || '')) {
-          if (!st.fixAt || at < st.fixAt) st.fixAt = at;
-        }
-      }
+  }
+
+  // PagerDuty is polled every PD_POLL_MS even though the state machine ticks faster.
+  const pdCache = { at: 0, incidents: null, since: null };
+  async function pagerDutyIncidents(since, now) {
+    if (!pdEnabled) return null;
+    if (now - pdCache.at < PD_POLL_MS && pdCache.since === since) return pdCache.incidents;
+    pdCache.at = now;
+    pdCache.since = since;
+    try {
+      pdCache.incidents = await fetchIncidents(since);
+    } catch (err) {
+      pdCache.incidents = null;
+      logger.warn(`incident panel: PagerDuty unavailable, using health summary: ${err.message}`);
     }
+    return pdCache.incidents;
   }
 
   // ---- state machine ----
@@ -167,37 +153,15 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
     try { await runTick(); } finally { busy = false; }
   }
 
-  // PagerDuty is polled every PD_POLL_MS even though the state machine ticks faster (to notice a reset quickly).
-  const pdCache = { at: 0, incidents: null, since: null, fetches: 0 };
-  async function pagerDutyIncidents(since, now) {
-    if (!pdEnabled) return null;
-    if (now - pdCache.at < PD_POLL_MS && pdCache.since === since) return pdCache.incidents;
-    pdCache.at = now;
-    pdCache.since = since;
-    try {
-      pdCache.incidents = await fetchIncidents(since);
-      pdCache.fetches++;
-    } catch (err) {
-      pdCache.incidents = null;
-      logger.warn(`incident panel: PagerDuty unavailable, using health summary: ${err.message}`);
-    }
-    return pdCache.incidents;
-  }
-
-  function resolveNow(at, why) {
-    st.resolvedAt = at;
-    st.phase = 'resolved';
-    st.frozen = measure(at);
-    logger.info(`incident panel: resolved (${why}) after ${Math.round((at - st.startedAt) / 1000)}s scenario=${st.scenario}`);
-  }
-
   async function runTick() {
     const now = Date.now();
-    const chaos = await fetchChaos();
-    if (chaos && chaos.resetting) {
+    const chaos = await chaosCall('/state');
+    if (!chaos) return; // chaos-api unreachable: keep showing the last known story
+    story = chaos.story || { phase: 'idle' };
+    if (chaos.resetting) {
       if (!resetting) logger.info('incident panel: reset in progress');
       resetting = true;
-      st = fresh();
+      st = fresh(null);
       pdCache.at = 0;
       return;
     }
@@ -206,88 +170,70 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
       sampler.setErrorGrace(RESET_ERROR_GRACE_MS);
       logger.info('incident panel: reset finished');
     }
-    if (chaos && chaos.scenario) sampler.setErrorGrace(0);
-    if (chaos && !chaos.scenario) {
-      if (chaos.outcome === 'fixed') {
-        // A remediation cleared the scenario: that is a resolution, not a reset.
-        if (st.phase === 'incident') resolveNow(now, 'scenario cleared by a fix');
-        return;
-      }
-      // No active scenario (fresh install, or reset just ran): clear everything.
-      if (st.phase !== 'healthy' || st.lastTickAt) logger.info('incident panel: no active scenario, state cleared');
-      st = fresh();
+    if (story.phase === 'idle') {
+      if (st.storyId !== null) logger.info('incident panel: story cleared');
+      st = fresh(null);
       pdCache.at = 0;
       return;
     }
-    if (st.phase === 'resolved') return; // frozen until reset
-    if (chaos) { st.scenario = chaos.scenario; st.mode = chaos.mode; }
+    if (st.storyId !== story.startedAt) st = fresh(story.startedAt);
+    st.scenario = story.scenario;
+    if (story.phase === 'resolved') return; // frozen until a clear path runs
+    sampler.setErrorGrace(0);
 
     const detail = sampler.detail();
     const services = detail ? detail.services : [];
     const degraded = services.filter((s) => !s.healthy || s.erroring);
     const order = services.find((s) => s.name === sampleOrderService);
     st.orderUnhealthyNow = Boolean(order && (!order.healthy || order.erroring));
+    const dt = st.lastTickAt ? now - st.lastTickAt : 0;
+    st.lastTickAt = now;
+    if (story.detectedAt && st.orderUnhealthyNow) st.orderUnhealthyMs += dt;
 
-    // PagerDuty: incidents on the TradeSim services since the scenario started. Failure falls back to health only.
-    const since = (chaos && ts(chaos.since)) || bootAt;
-    const incidents = await pagerDutyIncidents(since, now);
+    const incidents = await pagerDutyIncidents(story.startedAt, now);
     st.source = incidents ? 'pagerduty' : 'health-summary';
     if (incidents) st.incidents = incidents;
     const open = incidents ? incidents.filter((i) => i.status !== 'resolved') : [];
-
-    if (st.phase === 'healthy') {
-      const signal = degraded.length > 0 || (incidents && incidents.length > 0);
-      if (!signal) { st.lastTickAt = now; return; }
-      const created = incidents && incidents.length ? Math.min(...incidents.map((i) => ts(i.created_at))) : now;
-      st.phase = 'incident';
-      st.startedAt = Math.min(now, created);
-      st.lastTickAt = now;
-      logger.info(`incident panel: incident started (${degraded.map((s) => s.name).join(', ') || 'from PagerDuty'}) scenario=${st.scenario}`);
+    for (const i of open) {
+      for (const a of i.assignments || []) if (a.assignee && a.assignee.type.startsWith('user')) st.engineers.add(a.assignee.id);
+      for (const a of i.acknowledgements || []) if (a.acknowledger && a.acknowledger.type.startsWith('user')) st.engineers.add(a.acknowledger.id);
     }
 
-    // incident phase
-    const dt = st.lastTickAt ? now - st.lastTickAt : 0;
-    st.lastTickAt = now;
-    if (st.orderUnhealthyNow) st.orderUnhealthyMs += dt;
-
-    if (!st.restartAt) {
-      const restart = sampler.restartsSince(st.startedAt + RESTART_NOTE_AFTER_S * 1000).find((r) => !st.fixAt || r.at < st.fixAt);
-      if (restart) st.restartAt = restart.at;
+    if (story.phase === 'incident') {
+      // First unhealthy signal. A restart right at the start is the rollout of the fault itself, so it only counts later.
+      const restarted = sampler.restartsSince(story.startedAt + RESTART_NOTE_AFTER_S * 1000).length > 0;
+      if (!story.detectedAt && (degraded.length > 0 || restarted || (incidents && incidents.length > 0))) {
+        const updated = await chaosCall('/story/detected', {});
+        if (updated) { story = updated; logger.info(`incident panel: detected (${degraded.map((s) => s.name).join(', ') || 'restart or PagerDuty'}) scenario=${story.scenario}`); }
+      }
+      return;
     }
 
-    if (incidents && incidents.length) {
-      st.detectedAt = Math.min(...incidents.map((i) => ts(i.created_at)));
-      for (const i of open) {
-        for (const a of i.assignments || []) if (a.assignee && a.assignee.type.startsWith('user')) st.engineers.add(a.assignee.id);
-        for (const a of i.acknowledgements || []) if (a.acknowledger && a.acknowledger.type.startsWith('user')) st.engineers.add(a.acknowledger.id);
-      }
-      if (pdCache.at === now && (!st.rootCauseAt || !st.fixAt)) {
-        try { await enrichFromPagerDuty(incidents); } catch (err) { logger.warn(`incident panel: PagerDuty detail lookup failed: ${err.message}`); }
-      }
+    // fixing
+    if (!st.rootCause && incidents && incidents.length && pdCache.at === now) {
+      try { await findRootCauseNote(incidents); } catch (err) { logger.warn(`incident panel: PagerDuty note lookup failed: ${err.message}`); }
     }
+    if (story.fixKind === 'partial') { st.healthySince = null; return; } // the cause is still there: never resolves
+    if (degraded.length === 0) { if (!st.healthySince) st.healthySince = now; } else st.healthySince = null;
 
-    // Resolved: see the header comment. Health alone only counts when no scenario is known.
-    let quiet;
-    if (st.source === 'pagerduty') quiet = incidents.length > 0 && open.length === 0;
-    else if (!st.scenario) quiet = degraded.length === 0;
-    else quiet = false;
-    if (quiet) { if (!st.healthySince) st.healthySince = now; } else st.healthySince = null;
-    if (!quiet) return;
-    if (st.source === 'pagerduty') {
-      if (now - st.healthySince >= PD_STABLE_MS && (now - st.startedAt) / 1000 >= MIN_INCIDENT_S) {
-        const resolvedAt = Math.max(...incidents.map((i) => ts(i.last_status_change_at) || 0), st.healthySince);
-        resolveNow(Math.min(resolvedAt, now), 'PagerDuty incident resolved');
-      }
-    } else if (now - st.healthySince >= HEALTH_ONLY_RESOLVE_S * 1000) {
-      resolveNow(st.healthySince, `healthy for ${HEALTH_ONLY_RESOLVE_S}s`);
+    let why = null;
+    if (st.healthySince && now - st.healthySince >= RESOLVE_HEALTHY_S * 1000) why = `healthy for ${RESOLVE_HEALTHY_S}s`;
+    else if (incidents && incidents.length > 0 && open.length === 0) {
+      const resolvedAt = Math.max(...incidents.map((i) => ts(i.last_status_change_at) || 0));
+      if (resolvedAt >= story.fixAt) why = 'PagerDuty incident resolved';
+    }
+    if (why) {
+      const resolved = await chaosCall('/story/resolve', { why, frozen: measure(now) });
+      if (resolved) { story = resolved; logger.info(`incident panel: resolved (${why}) after ${Math.round((story.resolvedAt - story.detectedAt) / 1000)}s scenario=${story.scenario}`); }
     }
   }
 
   // ---- outputs ----
-  const presetHeadlines = () => HEADLINES[st.scenario] || GENERIC_HEADLINES;
+  const presetHeadlines = () => HEADLINES[story.scenario] || GENERIC_HEADLINES;
+  const active = () => story.phase === 'incident' || story.phase === 'fixing';
 
   function recordFailedOrder(value) {
-    if (!(value > 0)) return;
+    if (!(value > 0) || !active()) return;
     const now = Date.now();
     st.failedOrders = st.failedOrders.filter((o) => now - o.at < FAILED_ORDER_KEEP_MS);
     st.failedOrders.push({ at: now, value });
@@ -295,15 +241,16 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
 
   // An order that filled while the price feed was stale (S3). Counted only while a stale-price scenario is active.
   function recordFill(value, priceAgeS) {
-    if (!(value > 0) || !(priceAgeS > STALE_FEED_S) || !STALE_SCENARIOS.has(st.scenario)) return;
+    if (!(value > 0) || !(priceAgeS > STALE_FEED_S) || !active() || !STALE_SCENARIOS.has(story.scenario)) return;
     const now = Date.now();
     st.staleTrades = st.staleTrades.filter((o) => now - o.at < FAILED_ORDER_KEEP_MS);
     st.staleTrades.push({ at: now, value });
   }
 
+  // Numbers at time `end`. The timer starts at detection (0 until then).
   function measure(end) {
-    const elapsedS = Math.max(0, (end - st.startedAt) / 1000);
-    const failed = st.failedOrders.filter((o) => o.at >= st.startedAt && o.at <= end).reduce((sum, o) => sum + o.value, 0);
+    const elapsedS = story.detectedAt ? Math.max(0, (end - story.detectedAt) / 1000) : 0;
+    const failed = st.failedOrders.filter((o) => o.at >= story.startedAt && o.at <= end).reduce((sum, o) => sum + o.value, 0);
     const stale = st.staleTrades.filter((o) => o.at <= end);
     const engineers = Math.max(config.defaultEngineers, st.engineers.size);
     return {
@@ -316,14 +263,15 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
     };
   }
 
-  function timeline(m) {
-    const rel = (at) => (at ? Math.max(0, Math.round((at - st.startedAt) / 1000)) : null);
-    const resolved = st.phase === 'resolved';
+  function timeline() {
+    const rel = (at) => (at && story.detectedAt ? Math.max(0, Math.round((at - story.detectedAt) / 1000)) : null);
+    const fixing = story.phase === 'fixing' || story.phase === 'resolved';
+    const resolved = story.phase === 'resolved';
     return [
-      { key: 'detected', label: 'Detected', elapsedS: rel(st.detectedAt || st.startedAt), detail: null },
-      { key: 'root_cause', label: 'Root cause found', elapsedS: rel(st.rootCauseAt), detail: st.rootCause, url: st.rootCauseUrl },
-      { key: 'fix', label: 'Fix approved', elapsedS: rel(st.fixAt), detail: null },
-      { key: 'resolved', label: 'Resolved', elapsedS: resolved ? Math.round(m.elapsedS) : null, detail: null },
+      { key: 'detected', label: 'Detected', elapsedS: rel(story.detectedAt), detail: null },
+      { key: 'root_cause', label: 'Root cause found', elapsedS: fixing ? rel(story.fixAt) : null, detail: fixing ? st.rootCause || presetHeadlines()[0] : null, url: fixing ? st.rootCauseUrl : null },
+      { key: 'fix', label: 'Fix approved', elapsedS: fixing ? rel(story.fixAt) : null, detail: null },
+      { key: 'resolved', label: 'Resolved', elapsedS: resolved ? rel(story.resolvedAt) : null, detail: null },
     ];
   }
 
@@ -331,7 +279,7 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
   function delivered() {
     const [d, r, p] = presetHeadlines();
     return {
-      scenario: st.scenario,
+      scenario: story.scenario,
       blocks: [
         { key: 'detect', title: 'DETECT', headline: d, value: DELIVERED_VALUES.detect },
         { key: 'resolve', title: 'RESOLVE', headline: r, value: DELIVERED_VALUES.resolve },
@@ -341,24 +289,30 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
   }
 
   function snapshot() {
-    const base = { phase: st.phase, source: st.source, serverNow: Date.now() };
+    const base = { phase: story.phase, source: st.source, serverNow: Date.now() };
     if (resetting) return { ...base, phase: 'resetting' };
-    if (st.phase === 'healthy') return base;
-    const resolved = st.phase === 'resolved';
-    const m = resolved ? st.frozen : measure(Date.now());
-    const kind = STALE_SCENARIOS.has(st.scenario) ? 'stale' : 'revenue';
+    if (story.phase === 'idle') return base;
+    const resolved = story.phase === 'resolved';
+    const m = resolved ? story.frozen || measure(story.resolvedAt) : measure(Date.now());
+    const kind = STALE_SCENARIOS.has(story.scenario) ? 'stale' : 'revenue';
     return {
       ...base,
-      scenario: st.scenario,
-      startedAt: st.startedAt,
-      resolvedAt: st.resolvedAt,
+      scenario: story.scenario,
+      startedAt: story.startedAt,
+      detectedAt: story.detectedAt,
+      fixAt: story.fixAt,
+      resolvedAt: story.resolvedAt,
       metrics: {
         kind, revenueAtRisk: m.revenueAtRisk, staleTrades: m.staleTrades, staleExposure: m.staleExposure,
         timeToResolveS: Math.round(m.elapsedS), engineers: m.engineers, cost: m.cost,
       },
-      live: resolved ? null : { orderUnhealthy: kind === 'revenue' && st.orderUnhealthyNow, revenuePerS: config.revenuePerS, hourlyRate: config.hourlyRate },
-      timeline: timeline(m),
-      notes: st.restartAt ? [{ label: 'Pod restarted automatically, issue persists', elapsedS: Math.max(0, Math.round((st.restartAt - st.startedAt) / 1000)) }] : [],
+      live: active() && story.detectedAt
+        ? { orderUnhealthy: kind === 'revenue' && st.orderUnhealthyNow, revenuePerS: config.revenuePerS, hourlyRate: config.hourlyRate }
+        : null,
+      timeline: timeline(),
+      notes: story.fixKind === 'partial' && !resolved
+        ? [{ label: 'Pod restarted, issue persists', elapsedS: Math.max(0, Math.round((story.fixAt - story.detectedAt) / 1000)) }]
+        : [],
       comparison: config.comparison,
       delivered: resolved ? delivered() : null,
     };

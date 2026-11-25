@@ -118,12 +118,12 @@ app.get('/api/incident-panel', route(async (req, res) => {
 }));
 
 // Banner: driven by the same snapshot as /api/incident-panel so the two always agree. Degraded while an incident is
-// in progress (silent faults such as S1 keep every /health green); resetting while scripts/reset.sh runs.
+// in progress or being fixed (silent faults such as S1 keep every /health green); resetting while scripts/reset.sh runs.
 app.get('/api/status', route(async (req, res) => {
   const { phase, source } = panel.snapshot();
   const summary = sampler.summary();
   res.json({
-    degraded: phase === 'incident',
+    degraded: phase === 'incident' || phase === 'fixing',
     resetting: phase === 'resetting',
     source,
     unhealthy: summary.services.filter((s) => !s.healthy).map((s) => s.name),

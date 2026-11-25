@@ -78,7 +78,7 @@ async function api(path, { method = 'GET', body, timeoutMs } = {}) {
 function errorBox(err, extraClass = '') {
   const phase = panelData && panelData.phase;
   const systemError = err.status === 0 || err.status >= 500;
-  const incidentRelated = systemError || phase === 'incident' || phase === 'resetting';
+  const incidentRelated = systemError || phase === 'incident' || phase === 'fixing' || phase === 'resetting';
   return h('div', { class: `msg error ${extraClass}`, role: 'alert', 'data-incident': incidentRelated },
     err.message,
     err.ref ? h('span', { class: 'ref' }, `Reference: ${err.ref}`) : null);
@@ -376,6 +376,7 @@ async function pollHealth() {
 // The banner follows the same /api/incident-panel data as the panel, so the two always agree.
 const BANNER_TEXT = {
   incident: "Trading is degraded. We're working on it.",
+  fixing: "Trading is degraded. We're working on it.",
   resetting: 'Applying scheduled updates. Back in a moment.',
 };
 function paintBanner() {
@@ -408,11 +409,11 @@ function resetUi() {
 
 function onPhaseChange(prev, next) {
   if (next === 'resetting' || prev === 'resetting') resetUi();
-  else if (prev === 'incident' && (next === 'healthy' || next === 'resolved')) restoreUi();
+  else if ((prev === 'incident' || prev === 'fixing') && (next === 'idle' || next === 'resolved')) restoreUi();
 }
 
 // ---------- floating panels: incident status (right) and reliability delivered (left) ----------
-// State comes from /api/incident-panel (the gateway polls PagerDuty every 5s). Time and cost tick locally each second.
+// State comes from /api/incident-panel (the story lives in chaos-api; the gateway merges in metrics). Time and cost tick locally each second.
 const incidentEl = document.getElementById('incident-panel');
 const deliveredEl = document.getElementById('delivered-panel');
 const BLOCK_STAGGER_MS = 600;
@@ -437,12 +438,13 @@ function paintIncidentPanel() {
     incidentEl.append(h('span', { class: 'dot idle', 'aria-hidden': 'true' }), 'Applying updates…');
     return;
   }
-  if (!d || d.phase === 'healthy') {
+  if (!d || d.phase === 'idle') {
     incidentEl.classList.add('pill');
     incidentEl.append(h('span', { class: 'dot ok', 'aria-hidden': 'true' }), 'All systems operational · Monitored by PagerDuty');
     return;
   }
   const resolved = d.phase === 'resolved';
+  const chip = resolved ? 'RESOLVED' : d.phase === 'fixing' ? 'FIXING' : d.detectedAt ? 'IN PROGRESS' : 'INVESTIGATING…';
   const m = d.metrics;
   const stale = m.kind === 'stale';
   const first = stale
@@ -464,8 +466,8 @@ function paintIncidentPanel() {
   const notes = (d.notes || []).map((n) => h('li', { class: 'note' },
     h('span', { class: 'mark', 'aria-hidden': 'true' }, '↻'), h('span', {}, n.label), h('span', { class: 't' }, mmss(n.elapsedS))));
 
-  incidentEl.append(h('div', { class: `ipanel ${resolved ? 'resolved' : 'incident'}`, role: 'status' },
-    h('div', { class: 'ip-head' }, h('span', {}, 'TradeSim incident'), h('span', { class: 'ip-chip' }, resolved ? 'RESOLVED' : 'IN PROGRESS')),
+  incidentEl.append(h('div', { class: `ipanel ${resolved ? 'resolved' : 'incident'} ${d.phase}`, role: 'status' },
+    h('div', { class: 'ip-head' }, h('span', {}, 'TradeSim incident'), h('span', { class: 'ip-chip' }, chip)),
     h('div', { class: 'ip-metrics' },
       metric(stale ? 'Trades at stale prices' : 'Revenue at risk', first), metric('Time to resolve', time),
       metric('Engineers engaged', engineers), metric('Cost of response', cost)),
@@ -474,17 +476,17 @@ function paintIncidentPanel() {
     resolved ? h('div', { class: 'ip-checks' }, h('span', {}, '✓ Detect'), h('span', {}, '✓ Resolve'), h('span', {}, '✓ Prevent')) : null,
     resolved ? h('div', { class: 'ip-foot' }, 'PagerDuty Reliability Platform') : null));
 
-  if (!resolved) live = { revenue: stale ? null : first, time, cost, engineers };
+  if (!resolved && d.detectedAt) live = { revenue: stale ? null : first, time, cost, engineers };
   tickIncidentPanel();
 }
 
 // Extrapolates between polls: elapsed time, cost, and revenue while the order service is unhealthy.
 function tickIncidentPanel() {
   const d = panelData;
-  if (!live || !d || d.phase !== 'incident') return;
+  if (!live || !d || (d.phase !== 'incident' && d.phase !== 'fixing') || !d.detectedAt) return;
   const nowServer = Date.now() + panelClockSkew;
   const sinceSnapshotS = Math.max(0, (nowServer - d.serverNow) / 1000);
-  const elapsedS = Math.max(0, (nowServer - d.startedAt) / 1000);
+  const elapsedS = Math.max(0, (nowServer - d.detectedAt) / 1000);
   if (live.revenue) live.revenue.textContent = usd0(d.metrics.revenueAtRisk + (d.live.orderUnhealthy ? sinceSnapshotS * d.live.revenuePerS : 0));
   live.time.textContent = mmss(elapsedS);
   live.cost.textContent = usd0(d.metrics.engineers * (elapsedS / 60) * d.live.hourlyRate);
@@ -493,7 +495,7 @@ function tickIncidentPanel() {
 function paintDeliveredPanel() {
   const d = panelData;
   if (!d || d.phase !== 'resolved' || !d.delivered) {
-    // Back to healthy (reset): hide and rearm.
+    // Back to idle (a clear path ran): hide and rearm.
     deliveredTimers.forEach(clearTimeout);
     deliveredTimers = [];
     deliveredShown = false;
@@ -529,7 +531,7 @@ async function pollIncidentPanel() {
   const key = JSON.stringify(content);
   panelData = d;
   if (key !== panelKey) { panelKey = key; paintIncidentPanel(); }
-  if (phaseChanged || d.phase === 'healthy' || d.phase === 'resetting') paintDeliveredPanel();
+  if (phaseChanged || d.phase === 'idle' || d.phase === 'resetting') paintDeliveredPanel();
   paintBanner();
   if (phaseChanged) {
     paintHealth(lastServices);

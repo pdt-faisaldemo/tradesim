@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Usage: scenario.sh <S1|S2|S3|S4|S5|COMBO> [quick|deep]     (S1R and S4R are accepted as aliases of S1 and S4)
-# Performs the fault. Refuses when another scenario is active (state lives in chaos-api); FORCE=1 overrides.
-# `mode` is recorded in chaos-api and read by alert-bridge as demo_mode. Undo everything with scripts/reset.sh.
+# Performs the fault and starts the panel story (state lives in chaos-api). A resolved story is cleared automatically;
+# a story still in incident or fixing is refused (FORCE=1 overrides).
+# `mode` is recorded in chaos-api and read by alert-bridge as demo_mode. Fix with scripts/fix.sh, undo everything with scripts/reset.sh.
 set -uo pipefail
 here=$(dirname "$0")
 . "$here/lib.sh"
@@ -17,24 +18,31 @@ need curl
 BUILD_REF=${BUILD_REF_BASE:-$REPO_URL/compare/main...}
 DECOY_DELAY_S=${S2_DECOY_DELAY_S:-60}
 
-# ---- lock: one scenario at a time ----
+# ---- lock: one story at a time ----
+# idle: go. resolved: the previous story is cleared first (environment untouched). incident/fixing: refuse.
 if state=$(chaos_get /state); then
-  active=$(printf '%s' "$state" | jq -r '.scenario // empty')
-  if [ -n "$active" ] && [ "${FORCE:-0}" != 1 ]; then
-    echo "REFUSED: scenario $active is already active (mode=$(printf '%s' "$state" | jq -r .mode)). Run scripts/reset.sh first (or FORCE=1)." >&2
-    exit 3
-  fi
-  if [ "$(printf '%s' "$state" | jq -r '.outcome // empty')" = fixed ] && [ "${FORCE:-0}" != 1 ]; then
-    echo "REFUSED: the last scenario was fixed but not reset. Run scripts/reset.sh first (or FORCE=1)." >&2
-    exit 3
-  fi
+  phase=$(printf '%s' "$state" | jq -r '.story.phase // "idle"')
+  active=$(printf '%s' "$state" | jq -r '.story.scenario // empty')
+  case "$phase" in
+    idle) ;;
+    resolved)
+      log "previous story ($active) is resolved: clearing it before starting $id"
+      "$here/clear-story.sh" || die "could not clear the resolved story"
+      ;;
+    *)
+      if [ "${FORCE:-0}" != 1 ]; then
+        echo "REFUSED: scenario $active is still $phase. Fix it (scripts/fix.sh), then clear-story.sh, or run scripts/reset.sh (or FORCE=1)." >&2
+        exit 3
+      fi
+      ;;
+  esac
 else
   case "$id" in
     S3|COMBO) die "chaos-api is not reachable and $id needs it for the feedPaused flag (is k8s/platform/chaos-api.yaml deployed?)" ;;
-    *) warn "chaos-api is not reachable: scenario lock and demo_mode are not recorded" ;;
+    *) warn "chaos-api is not reachable: the story and demo_mode are not recorded" ;;
   esac
 fi
-chaos_post /state "$(jq -nc --arg s "$id" --arg m "$mode" '{scenario: $s, mode: $m}')" >/dev/null || true
+chaos_post /story/start "$(jq -nc --arg s "$id" --arg m "$mode" --argjson f "$([ "${FORCE:-0}" = 1 ] && echo true || echo false)" '{scenario: $s, mode: $m, force: $f}')" >/dev/null || true
 log "starting scenario $id mode=$mode"
 
 s1() {
@@ -83,4 +91,4 @@ case "$id" in
   S5) s5 ;;
   COMBO) s3; s4 ;;
 esac
-log "scenario $id active. Reset with scripts/reset.sh"
+log "scenario $id active. Fix with scripts/fix.sh, or reset with scripts/reset.sh"

@@ -24,7 +24,7 @@ need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
 kube() { echo "+ kubectl $*"; $K "$@"; }
 
 # Baseline image tag per service: gateway carries the UI build, everything else is v1.0.0.
-baseline_tag() { if [ "$1" = gateway ]; then echo v1.0.0-ui4; else echo v1.0.0; fi; }
+baseline_tag() { if [ "$1" = gateway ]; then echo v1.0.0-ui5; else echo v1.0.0; fi; }
 svc_port() {
   case "$1" in
     order) echo 8081 ;; risk) echo 8082 ;; account) echo 8083 ;; portfolio) echo 8084 ;; market-data) echo 8085 ;; gateway) echo 8080 ;;

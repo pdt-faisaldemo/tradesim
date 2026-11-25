@@ -29,14 +29,14 @@ Through the gateway (`http://<EC2_IP>/`): `/api/health-summary`, `/api/quotes`, 
 `/api/portfolio/c-1001`, `/api/orders`, `POST /api/orders {"symbol":"NVDA","qty":50}`.
 
 ## P4: fault scenarios, scripts, loadgen
-Baseline images: `gateway` `v1.0.0-ui4`, every other service `v1.0.0` (also `loadgen` and `chaos-api` `v1.0.0`).
+Baseline images: `gateway` `v1.0.0-ui5`, every other service `v1.0.0` (also `loadgen` and `chaos-api` `v1.0.0`).
 Fault images: `risk:v1.0.1` from `demo/bad-risk-check` (S1) and `portfolio:v1.0.1` from `demo/portfolio-leak` (S4).
 
 Build each with Actions -> `build-image` (inputs `service`, `git_ref`, `tag`):
 
 | service | git_ref | tag |
 |---|---|---|
-| gateway | main | v1.0.0-ui4 |
+| gateway | main | v1.0.0-ui5 |
 | account, market-data, risk, order, portfolio | main | v1.0.0 |
 | loadgen, chaos-api | main | v1.0.0 |
 | risk | demo/bad-risk-check | v1.0.1 |
@@ -65,10 +65,14 @@ when `PD_API_TOKEN` and `PD_SERVICE_IDS` are in `tradesim-secrets`, the PagerDut
 the API fails) it uses health and error-rate signals only.
 
 - A dot is red when `/health` fails or the service's `error_rate_30s` (from `/metrics`) is above 0.2 with 10+ requests.
-- While a scenario is active, health alone never shows Resolved. The panel stays in incident until the PagerDuty incident
-  is resolved (needs `PD_API_TOKEN`), or the scenario is cleared: `scripts/clear-scenario.sh` (called by the Rundeck fix
-  jobs) shows Resolved, `scripts/reset.sh` returns to healthy. With no scenario known (chaos-api unreachable) the
-  health-only fallback needs 60 consecutive healthy seconds.
+- The story lives in chaos-api (`/state` -> `story`), so it survives reloads and looks the same in every browser. Phases
+  only move forward: idle -> incident (scenario.sh starts it; "Investigating..." until the first unhealthy signal, then
+  Detected and the timer start) -> fixing (`scripts/fix.sh`) -> resolved (all services healthy 15s in a row after the
+  fix, or the PagerDuty incident resolved). Health never moves it backwards. S4's restart is a partial fix: it stays in
+  fixing ("Pod restarted, issue persists"); `scripts/fix.sh S4R` deploys v1.0.2.
+- Clear paths (the only way back to idle, both panels disappear): `scripts/reset.sh` (environment too),
+  `scripts/clear-story.sh` (story only), or `scripts/scenario.sh <S>` when the story is resolved (auto-clear). A
+  scenario still in incident or fixing is refused. Check a scenario end to end with `scripts/verify-story.sh <S>`.
 - "Root cause found" shows the `Panel summary:` line of the first incident note starting `SRE Agent:` (max 60 chars,
   cut at a word, with a link to the incident); without that line it shows the scenario's preset text. The left panel
   always uses preset headlines.

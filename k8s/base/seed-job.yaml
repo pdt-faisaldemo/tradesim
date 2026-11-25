@@ -92,6 +92,7 @@ spec:
       containers:
         - name: seed
           image: postgres:16-alpine
+          imagePullPolicy: Always
           command: ["sh", "-c"]
           args:
             - |

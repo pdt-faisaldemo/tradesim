@@ -21,8 +21,19 @@ const RESETTING_EXPIRES_MS = 3 * 60 * 1000;
 
 // loadCustomers: how many synthetic customers loadgen runs (5 normally, 20 during S2).
 const flags = { feedPaused: false, loadCustomers: BASE_LOAD_CUSTOMERS };
-// outcome: 'fixed' when a remediation (Rundeck) cleared the scenario, so the UI shows Resolved rather than a plain reset.
-const state = { scenario: null, mode: null, since: null, outcome: null };
+// The scenario that is active (kept until the story is cleared, alert-bridge reads it as demo_mode).
+const state = { scenario: null, mode: null, since: null };
+
+// The panel "story": the single source of truth for what the UI panels show. Phases only move forward:
+//   idle -> incident -> fixing -> resolved -> idle (only via POST /story/clear, which reset.sh and clear-story.sh call)
+// scenario.sh starts it, the gateway reports detection and resolution (it owns the health signals), fix.sh moves it to
+// fixing. kind 'partial' is a fix that does not remove the cause (S4 restart): the leak returns, so it never resolves.
+// Held in memory: a chaos-api restart returns to idle, which is what a redeploy followed by reset.sh wants anyway.
+const freshStory = () => ({
+  phase: 'idle', scenario: null, mode: null, startedAt: null, detectedAt: null,
+  fixAt: null, lastFixAt: null, fixScenario: null, fixKind: null, resolvedAt: null, resolvedWhy: null, frozen: null,
+});
+let story = freshStory();
 let resettingSince = null;
 const isResetting = () => resettingSince !== null && Date.now() - resettingSince < RESETTING_EXPIRES_MS;
 
@@ -32,7 +43,7 @@ app.use(requestLogger(logger, metrics));
 mountStandardRoutes(app, { service: SERVICE, version: VERSION, logger, metrics });
 
 app.get('/flags', (req, res) => res.json(flags));
-app.get('/state', (req, res) => res.json({ ...state, resetting: isResetting(), flags }));
+app.get('/state', (req, res) => res.json({ ...state, story, resetting: isResetting(), flags }));
 
 // POST /flags {feedPaused?: bool, loadCustomers?: int}
 app.post('/flags', (req, res) => {
@@ -43,19 +54,71 @@ app.post('/flags', (req, res) => {
   res.json(flags);
 });
 
-// POST /state {scenario?: string|null, mode?: 'quick'|'deep'|null, outcome?: 'fixed', resetting?: bool}
-// Only the fields present are changed. Setting or clearing the scenario also clears outcome unless it is 'fixed'.
+// POST /state {resetting?: bool}: reset.sh sets it for the duration of the reset.
 app.post('/state', (req, res) => {
   const b = req.body || {};
-  if ('scenario' in b) {
-    state.scenario = b.scenario || null;
-    state.mode = state.scenario ? b.mode || 'quick' : null;
-    state.since = state.scenario ? new Date().toISOString() : null;
-    state.outcome = !state.scenario && b.outcome === 'fixed' ? 'fixed' : null;
-  }
   if (typeof b.resetting === 'boolean') resettingSince = b.resetting ? Date.now() : null;
-  res.locals.logMsg = `state set scenario=${state.scenario} mode=${state.mode} outcome=${state.outcome} resetting=${isResetting()}`;
-  res.json({ ...state, resetting: isResetting() });
+  res.locals.logMsg = `state resetting=${isResetting()}`;
+  res.json({ ...state, story, resetting: isResetting() });
+});
+
+const refuse = (res, msg) => {
+  res.locals.logMsg = `story refused: ${msg}`;
+  return res.status(409).json({ error: msg, phase: story.phase });
+};
+const moved = (res, msg) => {
+  res.locals.logMsg = `story ${msg}`;
+  res.json(story);
+};
+
+// POST /story/start {scenario, mode, force?}: scenario.sh, the moment it starts. Only from idle (force overrides).
+app.post('/story/start', (req, res) => {
+  const b = req.body || {};
+  if (!b.scenario) return res.status(400).json({ error: 'scenario is required' });
+  if (story.phase !== 'idle' && !b.force) return refuse(res, `story is ${story.phase} (scenario ${story.scenario}), clear it first`);
+  story = { ...freshStory(), phase: 'incident', scenario: b.scenario, mode: b.mode || 'quick', startedAt: Date.now() };
+  Object.assign(state, { scenario: story.scenario, mode: story.mode, since: new Date(story.startedAt).toISOString() });
+  moved(res, `incident started scenario=${story.scenario} mode=${story.mode}`);
+});
+
+// POST /story/detected: the gateway saw the first unhealthy signal. Sets the time once, only while incident or fixing.
+app.post('/story/detected', (req, res) => {
+  if (story.phase !== 'incident' && story.phase !== 'fixing') return refuse(res, `cannot mark detected while ${story.phase}`);
+  if (!story.detectedAt) { story.detectedAt = Date.now(); return moved(res, `detected scenario=${story.scenario}`); }
+  res.json(story);
+});
+
+// POST /story/fix {scenario?, kind: 'full'|'partial'}: fix.sh, when it starts. Valid from incident or fixing.
+app.post('/story/fix', (req, res) => {
+  const b = req.body || {};
+  if (story.phase !== 'incident' && story.phase !== 'fixing') return refuse(res, `no incident to fix (story is ${story.phase})`);
+  const now = Date.now();
+  story.phase = 'fixing';
+  story.fixAt = story.fixAt || now;
+  story.lastFixAt = now;
+  story.detectedAt = story.detectedAt || now;
+  story.fixScenario = b.scenario || story.scenario;
+  story.fixKind = b.kind === 'partial' ? 'partial' : 'full';
+  moved(res, `fixing scenario=${story.scenario} fix=${story.fixScenario} kind=${story.fixKind}`);
+});
+
+// POST /story/resolve {why, frozen}: the gateway saw the services healthy long enough (or PagerDuty resolved). Only from fixing.
+app.post('/story/resolve', (req, res) => {
+  const b = req.body || {};
+  if (story.phase !== 'fixing') return refuse(res, `cannot resolve while ${story.phase}`);
+  story.phase = 'resolved';
+  story.resolvedAt = Date.now();
+  story.resolvedWhy = typeof b.why === 'string' ? b.why.slice(0, 80) : null;
+  story.frozen = b.frozen && typeof b.frozen === 'object' ? b.frozen : null;
+  moved(res, `resolved scenario=${story.scenario} why=${story.resolvedWhy}`);
+});
+
+// POST /story/clear: back to idle. The only way there. Does not touch flags or the environment.
+app.post('/story/clear', (req, res) => {
+  const was = story.phase;
+  story = freshStory();
+  Object.assign(state, { scenario: null, mode: null, since: null });
+  moved(res, `cleared (was ${was})`);
 });
 
 const server = app.listen(PORT, () => logger.info(`chaos-api listening on :${PORT}`));
