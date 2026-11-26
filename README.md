@@ -29,14 +29,14 @@ Through the gateway (`http://<EC2_IP>/`): `/api/health-summary`, `/api/quotes`, 
 `/api/portfolio/c-1001`, `/api/orders`, `POST /api/orders {"symbol":"NVDA","qty":50}`.
 
 ## P4: fault scenarios, scripts, loadgen
-Baseline images: `gateway` `v1.0.0-ui6`, every other service `v1.0.0` (also `loadgen` and `chaos-api` `v1.0.0`).
+Baseline images: `gateway` `v1.0.0-ui7`, every other service `v1.0.0` (also `loadgen` and `chaos-api` `v1.0.0`).
 Fault images: `risk:v1.0.1` from `demo/bad-risk-check` (S1) and `portfolio:v1.0.1` from `demo/portfolio-leak` (S4).
 
 Build each with Actions -> `build-image` (inputs `service`, `git_ref`, `tag`):
 
 | service | git_ref | tag |
 |---|---|---|
-| gateway | main | v1.0.0-ui6 |
+| gateway | main | v1.0.0-ui7 |
 | account, market-data, risk, order, portfolio | main | v1.0.0 |
 | loadgen, chaos-api | main | v1.0.0 |
 | risk | demo/bad-risk-check | v1.0.1 |
@@ -89,3 +89,29 @@ sudo k3s kubectl -n tradesim patch secret tradesim-secrets --type merge \
   -p "{\"stringData\":{\"PD_API_TOKEN\":\"...\",\"PD_SERVICE_IDS\":\"PXXXX,PYYYY\"}}"
 sudo k3s kubectl -n tradesim rollout restart deploy/gateway
 ```
+
+## P5 + P6: alert-bridge, /ops console, panel controls
+Images: `alert-bridge` `v1.0.0`, `chaos-api` `v1.0.1` (now includes kubectl, scripts/ and k8s/), `gateway` `v1.0.0-ui7`.
+
+**alert-bridge** (namespace platform) probes every service every 15s, reads pods in `tradesim`, checks postgres and redis, and
+sends Events API v2 alerts to the one routing key `PD_ROUTING_KEY` (dedup key `service:check`, `payload.component` = service).
+Checks: `health` (2 cycles), `error_rate` (>20%, 10+ requests), `latency` (p95 >2000ms, warning), `feed_stale`
+(market-data, >30s), `restarts` (restart or OOMKilled), `crashloop`. An alert resolves after 2 healthy cycles; `reset.sh` and
+`clear-story.sh` resolve all of them at once (`POST /resolve-all`). `custom_details` carries service, check, threshold, value,
+sample_log, scenario and demo_mode. `GET /status` lists the open alerts. Dry run:
+`kubectl -n platform set env deploy/alert-bridge DRY_RUN=true` (events are logged, not sent); back to live with `DRY_RUN=false`.
+
+**/ops** (served by chaos-api, ingress path `/ops`, basic auth `OPS_USER`/`OPS_PASSWORD`; without them it is disabled): one
+button per scenario, Quick/Deep, FIX, CLEAR STORY, RESET ALL, live phase, health dots, open alerts, link to the PagerDuty incident
+and the streamed output of the last script. Buttons are disabled when the story does not allow them. Phone friendly.
+
+**Secrets**: `scripts/secrets.sh` (run by `redeploy.sh`) copies `PD_*`, `OPS_*`, `GHCR_OWNER`, ... from `~/.tradesim.env` into
+`tradesim-secrets` in both namespaces.
+
+**Panels**: every header has a reset-position icon and a chevron that collapses the panel to an edge tab (the tab has a chevron
+to expand). Drag a header to move a panel; it snaps to screen edges and corners within 40px. Position and collapsed state are
+kept in localStorage per panel. The footer shows the gateway image tag, which tells you at a glance whether a new UI is live.
+
+**SRE Agent content**: `pagerduty/` has the runbooks and skills to upload to PagerDuty (see `pagerduty/README.md`).
+Verify alerts with `scripts/verify-alerts.sh <S>`.
+

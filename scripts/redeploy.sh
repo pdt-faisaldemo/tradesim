@@ -9,6 +9,9 @@ cd "$(dirname "$0")/.." || exit 1
 log "git pull"
 git pull --ff-only || die "git pull failed"
 
+log "sync secrets from ~/.tradesim.env into tradesim and platform"
+"$(dirname "$0")/secrets.sh" || warn "secrets were not synced"
+
 log "apply k8s/base and k8s/platform"
 # The seed job's spec is immutable once it ran; reset.sh recreates it, so a refusal here is expected and harmless.
 kube apply -R -f k8s/base/ || warn "some k8s/base objects were not applied (the seed job is recreated by reset.sh)"

@@ -1,4 +1,39 @@
-# Minimal chaos-api (P4): flags + scenario state. P6 adds the /ops console, RBAC and scripts.
+# chaos-api: flags, the panel story, the /ops console, and the scenario/fix/reset scripts (image includes kubectl + scripts/).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chaos-api
+  namespace: platform
+---
+# The scripts apply manifests, patch Deployments/ConfigMaps, roll back, rerun the seed job and read pods, all in tradesim only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: chaos-api-operator
+  namespace: tradesim
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps", "services"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: chaos-api-operator
+  namespace: tradesim
+subjects:
+  - {kind: ServiceAccount, name: chaos-api, namespace: platform}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: chaos-api-operator}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,18 +48,25 @@ spec:
     metadata:
       labels: {app: chaos-api}
     spec:
+      serviceAccountName: chaos-api
       containers:
         - name: chaos-api
-          image: ghcr.io/pdt-faisaldemo/tradesim-chaos-api:v1.0.0
+          image: ghcr.io/pdt-faisaldemo/tradesim-chaos-api:v1.0.1
           imagePullPolicy: Always
           ports:
             - containerPort: 8090
+          env:
+            - {name: IN_CLUSTER, value: "1"}
+            - {name: ALERT_BRIDGE_URL, value: "http://alert-bridge.platform:8095"}
+          # PD_ROUTING_KEY, PD_CHANGE_KEY_*, PD_API_TOKEN, PD_FROM_EMAIL, PD_SERVICE_IDS, OPS_USER, OPS_PASSWORD, GHCR_OWNER, ...
+          envFrom:
+            - secretRef: {name: tradesim-secrets, optional: true}
           readinessProbe:
             tcpSocket: {port: 8090}
             periodSeconds: 5
           resources:
-            requests: {cpu: 20m, memory: 32Mi}
-            limits: {memory: 128Mi}
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {memory: 256Mi}
 ---
 apiVersion: v1
 kind: Service
@@ -35,3 +77,21 @@ spec:
   selector: {app: chaos-api}
   ports:
     - {port: 8090, targetPort: 8090}
+---
+# Only /ops is reachable from outside (basic auth in chaos-api). /flags, /state and /story/* stay cluster-internal.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ops
+  namespace: platform
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - path: /ops
+            pathType: Prefix
+            backend:
+              service:
+                name: chaos-api
+                port: {number: 8090}

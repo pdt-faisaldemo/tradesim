@@ -11,5 +11,6 @@ need jq
 was=$(chaos_get /state | jq -r '.story.phase // "unknown"') || die "chaos-api not reachable: story not cleared"
 chaos_post /story/clear '{}' >/dev/null || die "chaos-api not reachable: story not cleared"
 log "story cleared (was $was). Environment untouched."
+resolve_alerts "story cleared"
 [ "$was" = resolved ] || [ "$was" = idle ] || warn "the story was $was, not resolved: the fault itself is still in place"
 exit 0

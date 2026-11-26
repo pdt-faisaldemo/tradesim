@@ -24,7 +24,7 @@ need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
 kube() { echo "+ kubectl $*"; $K "$@"; }
 
 # Baseline image tag per service: gateway carries the UI build, everything else is v1.0.0.
-baseline_tag() { if [ "$1" = gateway ]; then echo v1.0.0-ui6; else echo v1.0.0; fi; }
+baseline_tag() { if [ "$1" = gateway ]; then echo v1.0.0-ui7; else echo v1.0.0; fi; }
 svc_port() {
   case "$1" in
     order) echo 8081 ;; risk) echo 8082 ;; account) echo 8083 ;; portfolio) echo 8084 ;; market-data) echo 8085 ;; gateway) echo 8080 ;;
@@ -48,6 +48,32 @@ chaos_url() {
   ip=$($K -n platform get svc chaos-api -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
   if [ -n "$ip" ]; then echo "http://$ip:8090"; fi
 }
+# ---- alert-bridge ----
+# BRIDGE_URL wins; otherwise the Service ClusterIP of alert-bridge in the platform namespace. Empty output = not deployed.
+bridge_url() {
+  if [ -n "${BRIDGE_URL:-}" ]; then echo "$BRIDGE_URL"; return; fi
+  if [ "${IN_CLUSTER:-0}" = 1 ]; then echo "http://alert-bridge.platform:8095"; return; fi
+  local ip
+  ip=$($K -n platform get svc alert-bridge -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+  if [ -n "$ip" ]; then echo "http://$ip:8095"; fi
+}
+bridge_get() {
+  local url
+  url=$(bridge_url)
+  [ -n "$url" ] || return 1
+  curl -sf --max-time 3 "$url$1"
+}
+bridge_post() {
+  local url
+  url=$(bridge_url)
+  [ -n "$url" ] || return 1
+  curl -sf --max-time 10 -X POST -H 'content-type: application/json' -d "$2" "$url$1"
+}
+# Resolves every open alert-bridge alert right away. Not fatal: without alert-bridge there is nothing to resolve.
+resolve_alerts() {
+  if out=$(bridge_post /resolve-all "{\"reason\": \"$1\"}"); then log "alert-bridge: $(printf '%s' "$out" | tr -d '\n') alert(s) resolved ($1)"; else warn "alert-bridge not reachable: open alerts were not resolved right now"; fi
+}
+
 # chaos_get PATH / chaos_post PATH JSON: print the response body; return 1 when chaos-api cannot be reached.
 chaos_get() {
   local url

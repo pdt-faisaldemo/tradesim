@@ -1,0 +1,75 @@
+# alert-bridge (P5): probes every TradeSim service, reads pods in tradesim, sends PagerDuty Events API v2 alerts.
+# DRY_RUN=true logs events instead of sending: kubectl -n platform set env deploy/alert-bridge DRY_RUN=true
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alert-bridge
+  namespace: platform
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: alert-bridge-pod-reader
+  namespace: tradesim
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: alert-bridge-pod-reader
+  namespace: tradesim
+subjects:
+  - {kind: ServiceAccount, name: alert-bridge, namespace: platform}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: alert-bridge-pod-reader}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-bridge
+  namespace: platform
+  labels: {app: alert-bridge}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: alert-bridge}
+  template:
+    metadata:
+      labels: {app: alert-bridge}
+    spec:
+      serviceAccountName: alert-bridge
+      containers:
+        - name: alert-bridge
+          image: ghcr.io/pdt-faisaldemo/tradesim-alert-bridge:v1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8095
+          env:
+            - {name: DRY_RUN, value: "false"}
+            - {name: INTERVAL_S, value: "15"}
+            - {name: CHAOS_URL, value: "http://chaos-api.platform:8090"}
+            - {name: ERROR_RATE_THRESHOLD, value: "0.2"}
+            - {name: MIN_REQUESTS, value: "10"}
+            - {name: P95_THRESHOLD_MS, value: "2000"}
+            - {name: FEED_STALE_S, value: "30"}
+            - name: PD_ROUTING_KEY
+              valueFrom:
+                secretKeyRef: {name: tradesim-secrets, key: PD_ROUTING_KEY, optional: true}
+          readinessProbe:
+            httpGet: {path: /health, port: 8095}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 20m, memory: 48Mi}
+            limits: {memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alert-bridge
+  namespace: platform
+spec:
+  selector: {app: alert-bridge}
+  ports:
+    - {port: 8095, targetPort: 8095}

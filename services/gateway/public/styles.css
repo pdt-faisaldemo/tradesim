@@ -124,7 +124,8 @@ select:focus, input:focus, button:focus-visible, a:focus-visible { outline: 2px 
 
 /* side panels: left = reliability delivered, right = incident status. They live in rails beside the content (see .layout)
    so they never cover it. >=1600px: both rails always reserve 340px. 1100-1599px: rails scale down (min 260px), the left
-   rail only exists while its panel does. <1100px: panels are edge tabs that open as overlays. <900px: bottom sheets. */
+   rail only exists while its panel does. <1100px: panels are edge tabs that open as overlays. <900px: bottom sheets.
+   A panel the user dragged elsewhere is .floating: it leaves the rail, which then reserves no space. */
 :root { --tab-w: 2.6rem; --footer-h: 4.5rem; }
 .layout { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: stretch; }
 .layout > main { grid-column: 2; min-width: 0; width: 100%; }
@@ -135,6 +136,21 @@ select:focus, input:focus, button:focus-visible, a:focus-visible { outline: 2px 
 .rail.has-panel { padding-inline: 1rem; }
 .panel { font-size: .85rem; position: sticky; top: 4.6rem; max-height: calc(100vh - 4.6rem - var(--footer-h) - .75rem); overflow-y: auto; }
 .panel[hidden] { display: none; }
+.panel.floating { position: fixed; z-index: 40; width: min(330px, calc(100vw - 16px)); max-height: calc(100vh - 1rem); }
+.panel.dragging { cursor: grabbing; user-select: none; box-shadow: 0 10px 32px rgba(16, 24, 40, .3); }
+.panel.floating.pill { width: auto; }
+.rail.floating { width: 0; padding: 0; }
+
+/* drag handles (not on touch-scroll areas of the sheets) */
+@media (min-width: 900px) { .ip-head, .dp-title, .pill { cursor: grab; touch-action: none; user-select: none; } }
+
+/* header buttons: reset position and collapse, always visible */
+.ctl { display: inline-flex; align-items: center; gap: .3rem; flex: none; }
+.ctl-btn { background: var(--surface-2); border: 1px solid var(--border); color: var(--text); border-radius: 7px; width: 1.9rem; height: 1.9rem; line-height: 1; cursor: pointer; font-size: 1.15rem; font-weight: 700; padding: 0; display: inline-grid; place-items: center; }
+.ctl-btn:hover { background: var(--border); }
+.pos-reset { font-size: 1rem; font-weight: 400; }
+.ctl-btn:focus-visible, .rail-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 899px) { .pos-reset { display: none; } }
 
 .rail-tab {
   position: sticky; top: 4.6rem; width: var(--tab-w); writing-mode: vertical-rl; padding: .9rem .3rem; cursor: pointer;
@@ -142,14 +158,13 @@ select:focus, input:focus, button:focus-visible, a:focus-visible { outline: 2px 
   background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow);
 }
 .rail-tab:hover { background: var(--surface-2); }
+.rail-tab .tab-chev { writing-mode: horizontal-tb; display: inline-block; font-size: 1.2rem; font-weight: 700; line-height: 1; margin-bottom: .35rem; }
 .rail-tab.incident { color: var(--down); border-color: var(--down); }
-.rail-tab.resolved, .rail-left .rail-tab { color: var(--up); border-color: var(--up); }
+.rail-tab.resolved, .rail-tab.ok { color: var(--up); border-color: var(--up); }
+.rail-tab.idle { color: var(--muted); }
 .rail-tab[hidden], .rail:not(.collapsed) .rail-tab { display: none; }
 .rail.collapsed .panel { display: none; }
 .rail-right .rail-tab { margin-left: auto; }
-
-.chev { background: transparent; border: 1px solid var(--border); color: var(--text); border-radius: 6px; width: 1.6rem; height: 1.6rem; line-height: 1; cursor: pointer; font-size: 1rem; flex: none; padding: 0; }
-.chev:hover { background: var(--surface-2); }
 
 @media (min-width: 1100px) {
   .rail.has-panel { width: clamp(260px, 19vw, 340px); }
@@ -160,30 +175,32 @@ select:focus, input:focus, button:focus-visible, a:focus-visible { outline: 2px 
   .rail.collapsed { width: calc(var(--tab-w) + 2rem); }
 }
 @media (max-width: 1099px) {
-  .rail.has-panel:not(.idle) { width: calc(var(--tab-w) + .5rem); padding-inline: .25rem; }
-  /* idle: the small green pill sits above the content */
-  .rail-right.idle { grid-column: 1 / -1; grid-row: 1; width: auto; justify-self: center; padding: .75rem 1rem 0; }
-  .rail.has-panel:not(.collapsed):not(.idle) .panel { position: fixed; top: 4.6rem; z-index: 20; width: min(340px, calc(100vw - 1.5rem)); }
+  .rail.has-panel { width: calc(var(--tab-w) + .5rem); padding-inline: .25rem; }
+  .rail.has-panel:not(.collapsed) .panel { position: fixed; top: 4.6rem; z-index: 20; width: min(340px, calc(100vw - 1.5rem)); }
+  .rail.has-panel:not(.collapsed) .panel.pill { width: auto; max-width: calc(100vw - 1.5rem); }
   .rail-left .panel { left: .75rem; }
   .rail-right .panel { right: .75rem; }
 }
 @media (max-width: 899px) {
-  .rail.has-panel:not(.idle) { position: fixed; bottom: var(--footer-h); z-index: 20; width: auto; padding: 0; }
-  .rail-left:not(.idle) { left: .5rem; }
-  .rail-right:not(.idle) { right: .5rem; }
+  .rail.has-panel { position: fixed; bottom: var(--footer-h); z-index: 20; width: auto; padding: 0; }
+  .rail-left.has-panel { left: .5rem; }
+  .rail-right.has-panel { right: .5rem; }
   .rail-tab { position: static; writing-mode: horizontal-tb; width: auto; padding: .5rem .9rem; border-radius: 10px 10px 0 0; }
-  .rail.has-panel:not(.collapsed):not(.idle) .panel {
-    left: 0; right: 0; top: auto; bottom: var(--footer-h); width: auto; max-height: min(70vh, calc(100vh - 9rem));
+  .rail-tab .tab-chev { margin: 0 .2rem 0 0; transform: rotate(90deg); }
+  .rail.has-panel:not(.collapsed) .panel, .rail.has-panel:not(.collapsed) .panel.pill {
+    position: fixed; left: 0; right: 0; top: auto; bottom: var(--footer-h); width: auto; max-width: none; max-height: min(70vh, calc(100vh - 9rem));
     border-radius: 14px 14px 0 0;
   }
-  .rail.has-panel:not(.collapsed):not(.idle) { z-index: 30; } /* the open sheet covers the other panel's tab */
+  .rail.has-panel:not(.collapsed) { z-index: 30; } /* the open sheet covers the other panel's tab */
   body.has-tabs { padding-bottom: calc(var(--footer-h) + 3rem); }
 }
 
-.pill { display: inline-flex; align-items: center; gap: .5rem; background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: .4rem .85rem; box-shadow: var(--shadow); color: var(--muted); font-weight: 600; }
-.pill .dot { background: var(--up); }
+.pill { display: inline-flex; align-items: center; gap: .5rem; background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: .3rem .4rem .3rem .85rem; box-shadow: var(--shadow); color: var(--muted); font-weight: 600; }
+.pill .dot { background: var(--up); flex: none; }
 .pill .dot.idle { background: #9aa6b5; }
-.panel-right.pill { width: auto; position: static; }
+.pill-text { min-width: 0; }
+.panel-right.pill { width: auto; position: sticky; border-radius: 14px; }
+.panel-right.pill.floating { position: fixed; }
 
 .ipanel { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 6px 24px rgba(16, 24, 40, .18); overflow: hidden; }
 .ipanel.incident { border-color: var(--down); }
@@ -214,6 +231,8 @@ select:focus, input:focus, button:focus-visible, a:focus-visible { outline: 2px 
 .ip-link { grid-column: 2 / 4; font-size: .74rem; color: var(--accent); text-decoration: none; }
 .ip-link:hover { text-decoration: underline; }
 .ip-steps .d { grid-column: 2 / 4; font-size: .78rem; color: var(--muted); overflow-wrap: anywhere; }
+.ip-incident { padding: .6rem .9rem 0; }
+.ip-incident .ip-link { grid-column: auto; font-size: .8rem; }
 .ip-compare { padding: .75rem .9rem; color: var(--muted); font-size: .78rem; }
 .ip-checks { display: flex; justify-content: center; gap: 1rem; padding: .5rem .9rem; border-top: 1px solid var(--border); font-weight: 600; color: var(--up); }
 .ip-foot { text-align: center; padding: .4rem .9rem .6rem; font-size: .7rem; color: var(--muted); }

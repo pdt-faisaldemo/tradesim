@@ -136,7 +136,8 @@ app.use('/api', (req, res) => {
   res.status(404).json({ error: 'not found', traceId: req.traceId });
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
+// no-cache: the browser revalidates on every load (ETag), so a new image's UI is never hidden behind a cached copy.
+app.use(express.static(path.join(__dirname, 'public'), { setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache') }));
 
 const server = app.listen(PORT, () => logger.info(`gateway listening on :${PORT} upstreams: order=${ORDER_URL} portfolio=${PORTFOLIO_URL} market-data=${MARKET_DATA_URL} account=${ACCOUNT_URL}`));
 const shutdown = () => {

@@ -426,76 +426,185 @@ let live = null; // text nodes updated every second while an incident is open
 let deliveredShown = false;
 let deliveredTimers = [];
 
-// ---------- collapsible panels ----------
-// Each panel collapses to a slim tab on its edge (a bottom tab below 900px). The choice is remembered per panel, separately
-// for wide (>=1100px) and narrow screens: wide defaults to expanded, narrow to collapsed (the panel then opens as an overlay).
-// Collapsing never removes a panel; only a clear path (or a new scenario) does.
+// ---------- panel controls: collapse, drag, reset position ----------
+// Every panel header has a chevron that collapses the panel into a slim tab on its edge (a bottom tab below 900px); the tab
+// has a chevron to expand. Headers are draggable (>=900px): while dragging a panel snaps to the nearest screen edge or corner
+// within SNAP_PX, and the small reset icon puts it back in its rail. Collapsed state and position persist per panel in
+// localStorage. Collapsing or moving never removes a panel; only a clear path (or a new scenario) does.
+// Collapsed state is kept separately for wide (>=1100px) and narrow screens: wide defaults to expanded, narrow to
+// collapsed (the panel then opens as an overlay).
 const RAILS = {
-  left: { rail: document.getElementById('rail-left'), tab: document.getElementById('tab-left'), label: 'Reliability delivered' },
-  right: { rail: document.getElementById('rail-right'), tab: document.getElementById('tab-right'), label: 'Incident status' },
+  left: { rail: document.getElementById('rail-left'), tab: document.getElementById('tab-left'), panel: document.getElementById('delivered-panel'), label: 'Reliability delivered' },
+  right: { rail: document.getElementById('rail-right'), tab: document.getElementById('tab-right'), panel: document.getElementById('incident-panel'), label: 'Incident status' },
 };
+const SNAP_PX = 40;
+const SNAP_MARGIN = 8;
+const DRAG_START_PX = 4;
 const narrowMq = matchMedia('(max-width: 1099px)');
 const sheetMq = matchMedia('(max-width: 899px)');
 let panelsOnPage = true;
-const storeKey = (side) => `tradesim.panel.${side}.${narrowMq.matches ? 'narrow' : 'wide'}`;
+
+const storeGet = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
+const storeSet = (key, value) => { try { if (value == null) localStorage.removeItem(key); else localStorage.setItem(key, value); } catch { /* storage unavailable */ } };
+const collapsedKey = (side) => `tradesim.panel.${side}.${narrowMq.matches ? 'narrow' : 'wide'}`;
+const posKey = (side) => `tradesim.panel.${side}.pos`;
+
 function isCollapsed(side) {
-  let saved = null;
-  try { saved = localStorage.getItem(storeKey(side)); } catch { /* storage unavailable */ }
+  const saved = storeGet(collapsedKey(side));
   return saved ? saved === 'collapsed' : narrowMq.matches;
 }
 function setCollapsed(side, collapsed) {
-  const save = (sd, c) => { try { localStorage.setItem(storeKey(sd), c ? 'collapsed' : 'expanded'); } catch { /* storage unavailable */ } };
-  save(side, collapsed);
+  storeSet(collapsedKey(side), collapsed ? 'collapsed' : 'expanded');
   // Two bottom sheets would sit on top of each other: opening one closes the other.
-  if (!collapsed && sheetMq.matches) save(side === 'left' ? 'right' : 'left', true);
+  if (!collapsed && sheetMq.matches) storeSet(collapsedKey(side === 'left' ? 'right' : 'left'), 'collapsed');
   applyRails();
 }
-const chevron = (side) => h('button', {
-  class: 'chev', type: 'button', onclick: () => setCollapsed(side, true),
-  'aria-label': `Collapse ${RAILS[side].label.toLowerCase()} panel`, title: 'Collapse',
-}, side === 'left' ? '\u2039' : '\u203a');
+
+// Position: anchored to the nearest horizontal and vertical edge, so it survives a resize. {ax:'l'|'r', ay:'t'|'b', dx, dy}
+function getPos(side) {
+  try {
+    const p = JSON.parse(storeGet(posKey(side)));
+    return p && (p.ax === 'l' || p.ax === 'r') && (p.ay === 't' || p.ay === 'b') && Number.isFinite(p.dx) && Number.isFinite(p.dy) ? p : null;
+  } catch { return null; }
+}
+const setPos = (side, pos) => storeSet(posKey(side), pos ? JSON.stringify(pos) : null);
+
+function placePanel(side, pos) {
+  const el = RAILS[side].panel;
+  Object.assign(el.style, { left: 'auto', right: 'auto', top: 'auto', bottom: 'auto' });
+  if (!pos) return;
+  const vw = document.documentElement.clientWidth;
+  const vh = window.innerHeight;
+  const w = el.offsetWidth;
+  const hgt = el.offsetHeight;
+  // Keep it reachable when the window got smaller than when it was placed.
+  const dx = Math.max(0, Math.min(pos.dx, vw - w));
+  const dy = Math.max(0, Math.min(pos.dy, vh - hgt));
+  el.style[pos.ax === 'l' ? 'left' : 'right'] = `${dx}px`;
+  el.style[pos.ay === 't' ? 'top' : 'bottom'] = `${dy}px`;
+}
+
+// Snap a top-left position to the screen edges and corners within SNAP_PX.
+function snap(x, y, w, hgt) {
+  const vw = document.documentElement.clientWidth;
+  const vh = window.innerHeight;
+  let nx = Math.max(0, Math.min(x, vw - w));
+  let ny = Math.max(0, Math.min(y, vh - hgt));
+  if (nx < SNAP_PX) nx = SNAP_MARGIN;
+  else if (vw - (nx + w) < SNAP_PX) nx = vw - w - SNAP_MARGIN;
+  if (ny < SNAP_PX) ny = SNAP_MARGIN;
+  else if (vh - (ny + hgt) < SNAP_PX) ny = vh - hgt - SNAP_MARGIN;
+  return { x: nx, y: ny };
+}
+function anchorOf(x, y, w, hgt) {
+  const vw = document.documentElement.clientWidth;
+  const vh = window.innerHeight;
+  const left = x + w / 2 < vw / 2;
+  const top = y + hgt / 2 < vh / 2;
+  return { ax: left ? 'l' : 'r', ay: top ? 't' : 'b', dx: Math.round(left ? x : vw - x - w), dy: Math.round(top ? y : vh - y - hgt) };
+}
+
+let dragging = null; // { side, el, offX, offY, startX, startY, moved }
+const HANDLE = '.ip-head, .dp-title, .pill';
+for (const side of ['left', 'right']) {
+  const el = RAILS[side].panel;
+  el.addEventListener('pointerdown', (e) => {
+    if (sheetMq.matches || e.button !== 0 || !e.target.closest(HANDLE) || e.target.closest('button, a')) return;
+    const r = el.getBoundingClientRect();
+    dragging = { side, el, offX: e.clientX - r.left, offY: e.clientY - r.top, startX: e.clientX, startY: e.clientY, moved: false };
+    try { el.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
+  });
+  el.addEventListener('pointermove', (e) => {
+    if (!dragging || dragging.el !== el) return;
+    if (!dragging.moved) {
+      if (Math.hypot(e.clientX - dragging.startX, e.clientY - dragging.startY) < DRAG_START_PX) return;
+      // Leave the rail: from here on the panel floats at fixed coordinates.
+      el.classList.add('floating', 'dragging');
+      RAILS[side].rail.classList.add('floating');
+      RAILS[side].rail.classList.remove('has-panel');
+      dragging.moved = true;
+    }
+    const { x, y } = snap(e.clientX - dragging.offX, e.clientY - dragging.offY, el.offsetWidth, el.offsetHeight);
+    Object.assign(el.style, { left: `${x}px`, top: `${y}px`, right: 'auto', bottom: 'auto' });
+  });
+  const end = (e) => {
+    if (!dragging || dragging.el !== el) return;
+    const { moved } = dragging;
+    dragging = null;
+    el.classList.remove('dragging');
+    try { el.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
+    if (!moved) return;
+    const r = el.getBoundingClientRect();
+    setPos(side, anchorOf(r.left, r.top, r.width, r.height));
+    applyRails();
+  };
+  el.addEventListener('pointerup', end);
+  el.addEventListener('pointercancel', end);
+}
+
+const chevronChar = (side) => (side === 'left' ? '‹' : '›');
+const controls = (side) => h('span', { class: 'ctl' },
+  h('button', {
+    class: 'ctl-btn pos-reset', type: 'button', title: 'Reset position', 'aria-label': `Reset ${RAILS[side].label.toLowerCase()} panel position`,
+    onclick: () => { setPos(side, null); applyRails(); },
+  }, '↺'),
+  h('button', {
+    class: 'ctl-btn chev', type: 'button', title: 'Collapse', 'aria-label': `Collapse ${RAILS[side].label.toLowerCase()} panel`,
+    onclick: () => setCollapsed(side, true),
+  }, chevronChar(side)));
 
 // The right panel is a small pill while idle or resetting; the left one exists from resolved on.
 function railState() {
   const phase = panelData && panelData.phase;
-  const right = !phase || phase === 'idle' || phase === 'resetting' ? 'idle' : 'story';
-  return { right, leftShown: !deliveredEl.hidden };
+  return { right: !phase || phase === 'idle' || phase === 'resetting' ? 'idle' : 'story', leftShown: !deliveredEl.hidden };
 }
 
 function applyRails() {
   const { right, leftShown } = railState();
   const shown = { left: panelsOnPage && leftShown, right: panelsOnPage };
   for (const side of ['left', 'right']) {
-    const { rail, tab } = RAILS[side];
-    const idle = side === 'right' && right === 'idle';
-    const collapsed = shown[side] && !idle && isCollapsed(side);
+    const { rail, tab, panel } = RAILS[side];
+    const collapsed = shown[side] && isCollapsed(side);
+    const pos = getPos(side);
+    const floating = shown[side] && !collapsed && Boolean(pos) && !sheetMq.matches;
     rail.hidden = !panelsOnPage;
-    rail.classList.toggle('has-panel', shown[side]);
-    rail.classList.toggle('idle', idle);
+    rail.classList.toggle('has-panel', shown[side] && !floating); // a floating panel reserves no space
+    rail.classList.toggle('floating', floating);
     rail.classList.toggle('collapsed', collapsed);
+    panel.classList.toggle('floating', floating);
+    if (floating) { panel.style.width = ''; placePanel(side, pos); } else Object.assign(panel.style, { left: '', right: '', top: '', bottom: '', width: '' });
     tab.hidden = !collapsed;
     tab.setAttribute('aria-expanded', String(!collapsed));
   }
-  document.body.classList.toggle('has-tabs', shown.left || (shown.right && right !== 'idle'));
+  document.body.classList.toggle('has-tabs', shown.left || shown.right);
+  document.body.dataset.rightPanel = right;
   updateTabs();
 }
 
-// Tab text: "● Incident mm:ss" (incident, fixing), "✓ Resolved mm:ss" (resolved), "✓ Reliability".
+// Tab text: "● Incident mm:ss" (incident, fixing), "✓ Resolved mm:ss" (resolved), "✓ Reliability"; the right tab also
+// reads "✓ Operational" while idle. Each tab starts with the chevron that expands it.
+function setTab(tab, side, cls, text) {
+  tab.className = `rail-tab ${cls}`;
+  tab.replaceChildren(h('span', { class: 'tab-chev', 'aria-hidden': 'true' }, chevronChar(side === 'left' ? 'right' : 'left')), ` ${text}`);
+  tab.setAttribute('aria-label', `Expand ${RAILS[side].label.toLowerCase()} panel`);
+}
 function updateTabs() {
   const d = panelData;
-  const tabL = RAILS.left.tab;
-  const tabR = RAILS.right.tab;
-  tabL.textContent = '\u2713 Reliability';
-  if (!d || !d.metrics) return;
-  const resolved = d.phase === 'resolved';
+  setTab(RAILS.left.tab, 'left', 'resolved', '✓ Reliability');
+  const phase = d && d.phase;
+  if (!d || !d.metrics) {
+    setTab(RAILS.right.tab, 'right', phase === 'resetting' ? 'idle' : 'ok', phase === 'resetting' ? 'Updating…' : '✓ Operational');
+    return;
+  }
+  const resolved = phase === 'resolved';
   const elapsed = resolved ? d.metrics.timeToResolveS : d.detectedAt ? Math.max(0, (Date.now() + panelClockSkew - d.detectedAt) / 1000) : 0;
-  tabR.className = `rail-tab ${resolved ? 'resolved' : 'incident'}`;
-  tabR.textContent = `${resolved ? '\u2713 Resolved' : '\u25cf Incident'} ${mmss(elapsed)}`;
+  setTab(RAILS.right.tab, 'right', resolved ? 'resolved' : 'incident', `${resolved ? '✓ Resolved' : '● Incident'} ${mmss(elapsed)}`);
 }
 
 for (const side of ['left', 'right']) RAILS[side].tab.addEventListener('click', () => setCollapsed(side, false));
 narrowMq.addEventListener('change', applyRails);
 sheetMq.addEventListener('change', applyRails);
+window.addEventListener('resize', () => { if (!dragging) applyRails(); });
 new ResizeObserver(() => document.documentElement.style.setProperty('--footer-h', `${document.querySelector('.footer').offsetHeight}px`))
   .observe(document.querySelector('.footer'));
 
@@ -505,17 +614,18 @@ const usd0 = (n) => usd.format(Math.round(n)).replace(/\.00$/, '');
 function paintIncidentPanel() {
   const d = panelData;
   live = null;
-  applyRails();
   clear(incidentEl);
-  incidentEl.className = 'panel panel-right';
+  incidentEl.classList.remove('pill');
   if (d && d.phase === 'resetting') {
     incidentEl.classList.add('pill');
-    incidentEl.append(h('span', { class: 'dot idle', 'aria-hidden': 'true' }), 'Applying updates…');
+    incidentEl.append(h('span', { class: 'dot idle', 'aria-hidden': 'true' }), h('span', { class: 'pill-text' }, 'Applying updates…'), controls('right'));
+    applyRails();
     return;
   }
   if (!d || d.phase === 'idle') {
     incidentEl.classList.add('pill');
-    incidentEl.append(h('span', { class: 'dot ok', 'aria-hidden': 'true' }), 'All systems operational · Monitored by PagerDuty');
+    incidentEl.append(h('span', { class: 'dot ok', 'aria-hidden': 'true' }), h('span', { class: 'pill-text' }, 'All systems operational · Monitored by PagerDuty'), controls('right'));
+    applyRails();
     return;
   }
   const resolved = d.phase === 'resolved';
@@ -542,16 +652,21 @@ function paintIncidentPanel() {
     h('span', { class: 'mark', 'aria-hidden': 'true' }, '↻'), h('span', {}, n.label), h('span', { class: 't' }, mmss(n.elapsedS))));
 
   incidentEl.append(h('div', { class: `ipanel ${resolved ? 'resolved' : 'incident'} ${d.phase}`, role: 'status' },
-    h('div', { class: 'ip-head' }, h('span', {}, 'TradeSim incident'), h('span', { class: 'ip-head-end' }, h('span', { class: 'ip-chip' }, chip), chevron('right'))),
+    h('div', { class: 'ip-head' }, h('span', {}, 'TradeSim incident'), h('span', { class: 'ip-head-end' }, h('span', { class: 'ip-chip' }, chip), controls('right'))),
     h('div', { class: 'ip-metrics' },
       metric(stale ? 'Trades at stale prices' : 'Revenue at risk', first), metric('Time to resolve', time),
       metric('Engineers engaged', engineers), metric('Cost of response', cost)),
     h('div', { class: 'ip-section' }, h('h3', {}, 'Investigation led by Paige'), h('ol', { class: 'ip-steps' }, steps, notes)),
+    d.incident && d.incident.url
+      ? h('div', { class: 'ip-incident' }, h('a', { class: 'ip-link', href: d.incident.url, target: '_blank', rel: 'noopener noreferrer' },
+        `PagerDuty incident${d.incident.number ? ` #${d.incident.number}` : ''} · ${d.incident.status} →`))
+      : null,
     h('div', { class: 'ip-compare' }, `Typical without AI (illustrative): ${d.comparison}`),
     resolved ? h('div', { class: 'ip-checks' }, h('span', {}, '✓ Detect'), h('span', {}, '✓ Resolve'), h('span', {}, '✓ Prevent')) : null,
     resolved ? h('div', { class: 'ip-foot' }, 'PagerDuty Reliability Platform') : null));
 
   if (!resolved && d.detectedAt) live = { revenue: stale ? null : first, time, cost, engineers };
+  applyRails();
   tickIncidentPanel();
 }
 
@@ -588,7 +703,7 @@ function paintDeliveredPanel() {
     h('span', { class: 'dp-headline' }, b.headline),
     h('span', { class: 'dp-value' }, b.value)));
   clear(deliveredEl).append(h('div', { class: 'dpanel' },
-    h('div', { class: 'dp-title' }, h('span', {}, 'Reliability delivered'), chevron('left')), blocks,
+    h('div', { class: 'dp-title' }, h('span', {}, 'Reliability delivered'), controls('left')), blocks,
     h('div', { class: 'dp-foot' }, 'PagerDuty Reliability Platform')));
   deliveredEl.hidden = false;
   applyRails();
@@ -626,6 +741,7 @@ document.getElementById('theme-toggle').addEventListener('click', () => {
   try { localStorage.setItem('theme', next); } catch { /* storage unavailable */ }
 });
 
+fetch('/health').then((r) => r.json()).then((b) => { document.getElementById('ui-version').textContent = b.version ? `\u00b7 ${b.version}` : ''; }).catch(() => {});
 paintHealth([]);
 pollHealth();
 setInterval(pollHealth, 3000);

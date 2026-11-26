@@ -288,6 +288,12 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
     };
   }
 
+  // The PagerDuty incident behind this story (first one raised since it started), for the link in the panel.
+  function pagerDutyIncident() {
+    const inc = st.incidents.find((i) => safeUrl(i.html_url));
+    return inc ? { number: inc.incident_number, status: inc.status, url: safeUrl(inc.html_url) } : null;
+  }
+
   function snapshot() {
     const base = { phase: story.phase, source: st.source, serverNow: Date.now() };
     if (resetting) return { ...base, phase: 'resetting' };
@@ -309,6 +315,7 @@ function createIncidentPanel({ sampler, sampleOrderService = 'order', chaosUrl, 
       live: active() && story.detectedAt
         ? { orderUnhealthy: kind === 'revenue' && st.orderUnhealthyNow, revenuePerS: config.revenuePerS, hourlyRate: config.hourlyRate }
         : null,
+      incident: pagerDutyIncident(),
       timeline: timeline(),
       notes: story.fixKind === 'partial' && !resolved
         ? [{ label: 'Pod restarted, issue persists', elapsedS: Math.max(0, Math.round((story.fixAt - story.detectedAt) / 1000)) }]
