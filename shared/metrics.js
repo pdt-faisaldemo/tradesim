@@ -11,7 +11,7 @@ function createMetrics({ service, version, extra = () => ({}) }) {
 
   function bucketFor(sec) {
     const i = sec % WINDOW_S;
-    if (!buckets[i] || buckets[i].sec !== sec) buckets[i] = { sec, requests: 0, errors: 0, lat: [] };
+    if (!buckets[i] || buckets[i].sec !== sec) buckets[i] = { sec, requests: 0, errors: 0, errors5xx: 0, lat: [] };
     return buckets[i];
   }
 
@@ -20,6 +20,7 @@ function createMetrics({ service, version, extra = () => ({}) }) {
     const b = bucketFor(Math.floor(Date.now() / 1000));
     b.requests++;
     if (status >= 400) b.errors++;
+    if (status >= 500) b.errors5xx++;
     b.lat.push(latencyMs);
   }
 
@@ -29,6 +30,7 @@ function createMetrics({ service, version, extra = () => ({}) }) {
     let errors = 0;
     let requests30 = 0;
     let errors30 = 0;
+    let errors5xx30 = 0;
     let lat = [];
     for (const b of buckets) {
       if (!b || nowSec - b.sec >= WINDOW_S) continue;
@@ -37,6 +39,7 @@ function createMetrics({ service, version, extra = () => ({}) }) {
       if (nowSec - b.sec < SHORT_WINDOW_S) {
         requests30 += b.requests;
         errors30 += b.errors;
+        errors5xx30 += b.errors5xx;
       }
       lat = lat.concat(b.lat);
     }
@@ -50,6 +53,8 @@ function createMetrics({ service, version, extra = () => ({}) }) {
       error_rate: requests ? Math.round((errors / requests) * 1000) / 1000 : 0,
       requests_30s: requests30,
       error_rate_30s: requests30 ? Math.round((errors30 / requests30) * 1000) / 1000 : 0,
+      // 5xx only (upstream timeouts surface as 502/503/504): business rejections such as 409/422 are not outages
+      error_rate_5xx_30s: requests30 ? Math.round((errors5xx30 / requests30) * 1000) / 1000 : 0,
       p95_ms: Math.round(p95),
       uptime_s: Math.round((Date.now() - startedAt) / 1000),
       memory_rss_mb: Math.round((process.memoryUsage().rss / 1048576) * 10) / 10,

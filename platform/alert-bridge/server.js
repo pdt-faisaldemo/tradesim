@@ -34,6 +34,10 @@ const T = {
 };
 // error_rate over the last 30s (error_rate_30s) reacts and clears faster than the 60s window; ERROR_WINDOW=60 uses that.
 const ERROR_WINDOW = String(process.env.ERROR_WINDOW || '30');
+// order and gateway pass business rejections through as 4xx (risk 422, insufficient funds 409): only 5xx and timeouts count there.
+const SERVER_ERRORS_ONLY = new Set((process.env.SERVER_ERRORS_ONLY || 'order,gateway').split(',').map((x) => x.trim()).filter(Boolean));
+const errorRateOf = (name, m) => (SERVER_ERRORS_ONLY.has(name) && m.error_rate_5xx_30s !== undefined ? m.error_rate_5xx_30s
+  : ERROR_WINDOW === '60' ? m.error_rate : m.error_rate_30s ?? m.error_rate);
 
 const logger = createLogger({ service: SERVICE, version: VERSION });
 const metrics = createMetrics({ service: SERVICE, version: VERSION });
@@ -98,10 +102,11 @@ function podFacts(items) {
   for (const pod of items) {
     const app = pod.metadata && pod.metadata.labels && pod.metadata.labels.app;
     if (!app || pod.metadata.deletionTimestamp) continue;
-    const f = facts[app] || (facts[app] = { pods: [], restarts: 0, crashLoop: false, lastTerminated: null });
+    const f = facts[app] || (facts[app] = { pods: [], restarts: 0, crashLoop: false, lastTerminated: null, version: null });
     for (const c of (pod.status && pod.status.containerStatuses) || []) {
       f.pods.push({ uid: pod.metadata.uid, name: pod.metadata.name, restartCount: c.restartCount });
       f.restarts += c.restartCount;
+      if (c.image && c.image.includes(':')) f.version = c.image.split(':').pop();
       if (c.state && c.state.waiting && c.state.waiting.reason === 'CrashLoopBackOff') f.crashLoop = true;
       const t = c.lastState && c.lastState.terminated;
       if (t && (!f.lastTerminated || Date.parse(t.finishedAt) > Date.parse(f.lastTerminated.finishedAt))) f.lastTerminated = t;
@@ -127,20 +132,52 @@ function record(entry) {
   if (recent.length > 50) recent.length = 50;
 }
 
+// ---------- service catalog (what goes into the PagerDuty payload) ----------
+const CATALOG = {
+  gateway:       { bs: 'Trade Execution',    tier: 'tier-1', team: 'trading-experience', customer: true,  impact: 'customers cannot open the trading site or place trades' },
+  order:         { bs: 'Trade Execution',    tier: 'tier-1', team: 'trading-core',       customer: true,  impact: 'customers cannot place trades' },
+  risk:          { bs: 'Trade Execution',    tier: 'tier-1', team: 'trading-core',       customer: false, impact: 'new orders cannot be approved, so trading stops' },
+  account:       { bs: 'Trade Execution',    tier: 'tier-1', team: 'accounts-platform',  customer: false, impact: 'balances cannot be read or debited, so trading stops' },
+  postgres:      { bs: 'Trade Execution',    tier: 'tier-1', team: 'accounts-platform',  customer: false, impact: 'account and order data is unavailable, so trading stops' },
+  portfolio:     { bs: 'Portfolio Valuation', tier: 'tier-2', team: 'portfolio',          customer: true,  impact: 'customers cannot see their positions and P&L' },
+  'market-data': { bs: 'Market Data Feed',   tier: 'tier-2', team: 'market-data',        customer: true,  impact: 'customers see missing or outdated prices' },
+  redis:         { bs: 'Market Data Feed',   tier: 'tier-2', team: 'market-data',        customer: false, impact: 'price quotes cannot be served' },
+};
+const SIGNAL = { health: 'health', error_rate: 'errors', latency: 'latency', feed_stale: 'freshness', restarts: 'kubernetes', crashloop: 'kubernetes' };
+const IMPACT_BY_CHECK = {
+  latency: { default: 'customers see slow pages and delayed trades' },
+  feed_stale: { default: 'customers are trading on frozen prices' },
+};
+const impactOf = (service, check) => (IMPACT_BY_CHECK[check] && IMPACT_BY_CHECK[check].default) || CATALOG[service].impact;
+// "[TradeSim] order-service: error rate high (62% of requests failing, limit 20%) - customers cannot place trades"
+const summaryOf = (service, check, problem, numbers) => `[TradeSim] ${service}-service: ${problem} (${numbers}) - ${impactOf(service, check)}`;
+const TAG_KEYS = ['app', 'env', 'service', 'business_service', 'tier', 'team', 'customer_facing', 'signal', 'version', 'k8s_namespace'];
+
+function detailsOf(alert) {
+  const c = CATALOG[alert.service];
+  const flat = {
+    app: 'tradesim', env: 'production', service: alert.service, business_service: c.bs, tier: c.tier, team: c.team,
+    customer_facing: String(c.customer), signal: SIGNAL[alert.check] || alert.check, version: alert.version || 'unknown', k8s_namespace: NS,
+  };
+  return {
+    ...flat, check: alert.check, threshold: alert.threshold, value: alert.value, sample_log: alert.sampleLog,
+    business_impact: impactOf(alert.service, alert.check),
+    tags: TAG_KEYS.map((k) => `${k}:${flat[k]}`),
+    scenario: chaosState.scenario, demo_mode: chaosState.mode,
+  };
+}
+
 async function sendEvent(action, alert, extra = {}) {
   const body = { routing_key: ROUTING_KEY || '(unset)', event_action: action, dedup_key: alert.dedupKey };
   if (action === 'trigger') {
     body.payload = {
       summary: alert.summary,
-      source: 'tradesim-k3s',
+      source: `tradesim-k3s/tradesim/${alert.service}`,
       severity: alert.severity,
       component: alert.service,
-      group: 'tradesim',
+      group: CATALOG[alert.service].bs,
       class: alert.check,
-      custom_details: {
-        service: alert.service, check: alert.check, threshold: alert.threshold, value: alert.value,
-        sample_log: alert.sampleLog, demo_mode: chaosState.mode, scenario: chaosState.scenario,
-      },
+      custom_details: detailsOf(alert),
     };
   }
   const label = `${action} ${alert.dedupKey}`;
@@ -185,13 +222,13 @@ async function update(cond) {
     p.bad += 1;
     p.healthy = 0;
     progress.set(key, p);
-    if (alert) { alert.summary = cond.summary; alert.value = cond.value; return; }
+    if (alert) { alert.summary = cond.summary; alert.value = cond.value; alert.version = cond.version || alert.version; return; }
     if (Date.now() < suppressUntil) return;
     const need = cond.cycles || 1;
     if (p.bad < need) return;
     const fresh = {
       dedupKey: key, service: cond.service, check: cond.check, severity: cond.severity, summary: cond.summary,
-      threshold: cond.threshold, value: cond.value, sampleLog: (await sampleLog(cond.service)) || '(no error logged)', openedAt: new Date().toISOString(),
+      threshold: cond.threshold, value: cond.value, sampleLog: (await sampleLog(cond.service)) || '(no error logged)', version: cond.version, openedAt: new Date().toISOString(),
     };
     open.set(key, fresh);
     await sendEvent('trigger', fresh);
@@ -264,35 +301,36 @@ async function runCycle() {
   const everything = [...results, ...tcp];
   lastProbe = everything.map((r) => ({
     name: r.name, healthy: r.healthy, reason: r.reason,
-    error_rate: r.metrics ? (ERROR_WINDOW === '60' ? r.metrics.error_rate : r.metrics.error_rate_30s ?? r.metrics.error_rate) : null,
+    error_rate: r.metrics ? errorRateOf(r.name, r.metrics) : null,
     p95_ms: r.metrics ? r.metrics.p95_ms : null, last_tick_age_s: r.metrics ? r.metrics.last_tick_age_s ?? null : null,
   }));
 
   for (const r of everything) {
     const m = r.metrics;
+    const version = (facts && facts[r.name] && facts[r.name].version) || (m && m.version) || undefined;
     // health failing for HEALTH_CYCLES cycles in a row
     await update({
-      service: r.name, check: 'health', severity: 'critical', cycles: T.healthCycles, threshold: `${T.healthCycles} failing cycles`,
-      value: r.reason, summary: `${r.name}: health check failing (${r.reason})`, bad: !r.healthy, ok: r.healthy,
+      service: r.name, version, check: 'health', severity: 'critical', cycles: T.healthCycles, threshold: `${T.healthCycles} failing cycles`,
+      value: r.reason, summary: summaryOf(r.name, 'health', 'health check failing', `${r.reason}, failing ${T.healthCycles}+ checks in a row`), bad: !r.healthy, ok: r.healthy,
     });
     if (m) {
-      const rate = ERROR_WINDOW === '60' ? m.error_rate : m.error_rate_30s ?? m.error_rate;
+      const rate = errorRateOf(r.name, m);
       const reqs = ERROR_WINDOW === '60' ? m.requests : m.requests_30s ?? m.requests;
       const badRate = rate > T.errorRate && reqs >= T.minRequests;
       await update({
-        service: r.name, check: 'error_rate', severity: 'critical', threshold: T.errorRate, value: rate,
-        summary: `${r.name}: error rate ${pct(rate)} (threshold ${pct(T.errorRate)})`, bad: badRate, ok: !badRate,
+        service: r.name, version, check: 'error_rate', severity: 'critical', threshold: T.errorRate, value: rate,
+        summary: summaryOf(r.name, 'error_rate', SERVER_ERRORS_ONLY.has(r.name) ? 'server errors high' : 'error rate high', `${pct(rate)} of requests failing, limit ${pct(T.errorRate)}`), bad: badRate, ok: !badRate,
       });
       const slow = m.p95_ms > T.p95Ms;
       await update({
-        service: r.name, check: 'latency', severity: 'warning', threshold: T.p95Ms, value: m.p95_ms,
-        summary: `${r.name}: p95 latency ${m.p95_ms}ms (threshold ${T.p95Ms}ms)`, bad: slow, ok: !slow,
+        service: r.name, version, check: 'latency', severity: 'warning', threshold: T.p95Ms, value: m.p95_ms,
+        summary: summaryOf(r.name, 'latency', 'responses slow', `p95 ${m.p95_ms}ms, limit ${T.p95Ms}ms`), bad: slow, ok: !slow,
       });
       if (r.name === 'market-data' && typeof m.last_tick_age_s === 'number') {
         const stale = m.last_tick_age_s > T.feedStaleS;
         await update({
-          service: 'market-data', check: 'feed_stale', severity: 'critical', threshold: T.feedStaleS, value: m.last_tick_age_s,
-          summary: `market-data: price feed stale (last tick ${Math.round(m.last_tick_age_s)}s ago, threshold ${T.feedStaleS}s)`, bad: stale, ok: !stale,
+          service: 'market-data', version, check: 'feed_stale', severity: 'critical', threshold: T.feedStaleS, value: m.last_tick_age_s,
+          summary: summaryOf('market-data', 'feed_stale', 'price feed stale', `last price update ${Math.round(m.last_tick_age_s)}s ago, limit ${T.feedStaleS}s`), bad: stale, ok: !stale,
         });
       }
     }
@@ -320,14 +358,14 @@ async function runCycle() {
       const recently = Boolean(lr) && now - lr.at < T.restartWindowS * 1000;
       const oom = recently && lr.reason === 'OOMKilled';
       await update({
-        service: name, check: 'restarts', severity: 'critical', threshold: 'any restart', value: f.restarts,
-        summary: oom ? `${name}: container OOMKilled and restarted (${f.restarts} restarts)` : `${name}: pod restarted (${f.restarts} restarts, last exit: ${lr ? lr.reason : 'unknown'})`,
+        service: name, version, check: 'restarts', severity: 'critical', threshold: 'any restart', value: f.restarts,
+        summary: oom ? summaryOf(name, 'restarts', 'container ran out of memory and was restarted', `${f.restarts} restarts, OOMKilled`) : summaryOf(name, 'restarts', 'pod restarted', `${f.restarts} restarts, last exit ${lr ? lr.reason : 'unknown'}`),
         bad: recently, ok: !recently,
       });
       const t2 = f.lastTerminated;
       await update({
-        service: name, check: 'crashloop', severity: 'critical', threshold: 'CrashLoopBackOff', value: f.restarts,
-        summary: `${name}: CrashLoopBackOff (${f.restarts} restarts${t2 ? `, last exit: ${t2.reason} code ${t2.exitCode}` : ''})`, bad: f.crashLoop, ok: !f.crashLoop,
+        service: name, version, check: 'crashloop', severity: 'critical', threshold: 'CrashLoopBackOff', value: f.restarts,
+        summary: summaryOf(name, 'crashloop', 'pod crash-looping and cannot start', `${f.restarts} restarts${t2 ? `, last exit ${t2.reason} code ${t2.exitCode}` : ''}`), bad: f.crashLoop, ok: !f.crashLoop,
       });
     }
   }
